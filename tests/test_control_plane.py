@@ -230,8 +230,11 @@ class AuthenticationTest(unittest.TestCase):
 
     def test_tampered_token_is_rejected(self):
         token = self.auth.issue(Principal("tenant-a", "alice", frozenset({"auditor"})))
+        version, payload, signature = token.split(".", 2)
+        replacement = "0" if signature[0] != "0" else "1"
+        tampered = f"{version}.{payload}.{replacement}{signature[1:]}"
         with self.assertRaises(AuthenticationError):
-            self.auth.authenticate(f"Bearer {token[:-1]}0")
+            self.auth.authenticate(f"Bearer {tampered}")
 
 
 if __name__ == "__main__":
