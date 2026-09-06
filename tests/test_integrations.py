@@ -1,8 +1,10 @@
 import json
 import unittest
 
-from asv.domain import ProbeResult
+from asv.domain import ProbeObservation, ProbeResult
 from asv.integrations import (
+    CredentialBrokerProbe,
+    EgressGatewayProbe,
     HttpResult,
     IntegrationError,
     KafkaRestFenceProbe,
@@ -48,7 +50,36 @@ class FakeKubernetes:
         self.deleted.append((namespace, resource, name))
 
 
+class FakeBoundary:
+    def __init__(self, kind):
+        self.kind = kind
+        self.fenced = False
+
+    def fence(self, run):
+        self.fenced = True
+        return {"accepted": True}
+
+    def probe(self, run):
+        return ProbeObservation(
+            self.kind, ProbeResult.PASS, {"synthetic": True}, "fake-boundary", "deterministic"
+        )
+
+
 class KubernetesAdapterTest(unittest.TestCase):
+    def test_week4_boundaries_are_fenced_and_routed_to_their_probes(self):
+        credential = FakeBoundary("credential")
+        egress = FakeBoundary("network")
+        adapter = KubernetesKafkaAdapter(
+            FakeKubernetes(), {"asv-synthetic"}, credential=credential, egress=egress
+        )
+        fence = adapter.fence(RUN)
+        self.assertTrue(credential.fenced)
+        self.assertTrue(egress.fenced)
+        self.assertIn("credential_broker", fence)
+        self.assertIn("egress_gateway", fence)
+        self.assertEqual(ProbeResult.PASS, adapter.probe("credential", RUN).result)
+        self.assertEqual(ProbeResult.PASS, adapter.probe("network", RUN).result)
+
     def test_kubernetes_client_creates_idempotent_run_and_child_fences(self):
         calls = []
 
@@ -147,6 +178,102 @@ class KafkaFenceProbeTest(unittest.TestCase):
     def test_unobservable_status_is_unknown(self):
         observation, _ = self.probe([503, 403])
         self.assertEqual(ProbeResult.UNKNOWN, observation.result)
+
+
+class CredentialBrokerProbeTest(unittest.TestCase):
+    def probe(self, responses):
+        calls = []
+
+        def transport(method, url, headers, body):
+            calls.append((method, url, headers, body))
+            status, response_body = responses[len(calls) - 1]
+            return HttpResult(status, response_body)
+
+        probe = CredentialBrokerProbe(
+            "https://credentials.example.test",
+            "asv.synthetic/resource",
+            "controller-token",
+            transport=transport,
+        )
+        return probe.probe(RUN), calls
+
+    def test_denied_grant_and_revoked_existing_credential_is_pass(self):
+        observation, calls = self.probe([(403, {}), (200, {"active": False, "remaining_ttl_seconds": 0})])
+        self.assertEqual(ProbeResult.PASS, observation.result)
+        self.assertEqual(0, observation.observed["remaining_ttl_seconds"])
+        self.assertEqual(["POST", "GET"], [call[0] for call in calls])
+
+    def test_new_grant_or_active_old_credential_is_fail(self):
+        accepted, _ = self.probe([(201, {}), (200, {"active": False})])
+        active, _ = self.probe([(403, {}), (200, {"active": True, "remaining_ttl_seconds": 30})])
+        self.assertEqual(ProbeResult.FAIL, accepted.result)
+        self.assertEqual(ProbeResult.FAIL, active.result)
+
+    def test_ambiguous_broker_response_is_unknown(self):
+        observation, _ = self.probe([(503, {}), (503, {})])
+        self.assertEqual(ProbeResult.UNKNOWN, observation.result)
+
+    def test_credential_fence_requests_grant_denial_and_revocation(self):
+        calls = []
+
+        def transport(method, url, headers, body):
+            calls.append((method, url, headers, json.loads(body)))
+            return HttpResult(202, {})
+
+        probe = CredentialBrokerProbe(
+            "https://credentials.example.test", "resource", "token", transport=transport
+        )
+        result = probe.fence(RUN)
+        self.assertTrue(result["accepted"])
+        self.assertTrue(calls[0][3]["deny_new_grants"])
+        self.assertTrue(calls[0][3]["revoke_existing"])
+
+
+class EgressGatewayProbeTest(unittest.TestCase):
+    def probe(self, responses):
+        calls = []
+
+        def transport(method, url, headers, body):
+            calls.append((method, url, headers, body))
+            status, response_body = responses[len(calls) - 1]
+            return HttpResult(status, response_body)
+
+        probe = EgressGatewayProbe(
+            "https://egress.example.test",
+            "https://denied.example.test/asv",
+            "controller-token",
+            transport=transport,
+        )
+        return probe.probe(RUN), calls
+
+    def test_new_and_existing_connection_denial_is_pass(self):
+        observation, calls = self.probe([(200, {"allowed": False}), (403, {})])
+        self.assertEqual(ProbeResult.PASS, observation.result)
+        modes = [json.loads(call[3])["connection_mode"] for call in calls]
+        self.assertEqual(["new", "existing"], modes)
+
+    def test_any_remaining_network_authority_is_fail(self):
+        observation, _ = self.probe([(200, {"allowed": False}), (200, {"allowed": True})])
+        self.assertEqual(ProbeResult.FAIL, observation.result)
+
+    def test_unobservable_gateway_response_is_unknown(self):
+        observation, _ = self.probe([(503, {}), (403, {})])
+        self.assertEqual(ProbeResult.UNKNOWN, observation.result)
+
+    def test_egress_fence_blocks_new_and_terminates_existing_connections(self):
+        calls = []
+
+        def transport(method, url, headers, body):
+            calls.append((method, url, headers, json.loads(body)))
+            return HttpResult(202, {})
+
+        probe = EgressGatewayProbe(
+            "https://egress.example.test", "https://target.test", "token", transport=transport
+        )
+        result = probe.fence(RUN)
+        self.assertTrue(result["accepted"])
+        self.assertTrue(calls[0][3]["block_new_connections"])
+        self.assertTrue(calls[0][3]["terminate_existing_connections"])
 
 
 if __name__ == "__main__":

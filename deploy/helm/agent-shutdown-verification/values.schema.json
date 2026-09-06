@@ -21,7 +21,7 @@
     },
     "adapter": {
       "type": "object",
-      "required": ["mode", "allowedNamespaces", "kafkaRest"],
+      "required": ["mode", "allowedNamespaces", "kafkaRest", "credentialBroker", "egressGateway"],
       "properties": {
         "mode": {"enum": ["safe-unknown", "kubernetes"]},
         "allowedNamespaces": {
@@ -40,6 +40,26 @@
             "consumerGroup": {"type": "string", "minLength": 1},
             "consumerInstance": {"type": "string", "minLength": 1},
             "bearerTokenSecretKey": {"type": "string", "minLength": 1}
+          }
+        },
+        "credentialBroker": {
+          "type": "object",
+          "required": ["enabled", "url", "testResource", "controllerTokenSecretKey"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "url": {"type": "string"},
+            "testResource": {"type": "string", "minLength": 1},
+            "controllerTokenSecretKey": {"type": "string", "minLength": 1}
+          }
+        },
+        "egressGateway": {
+          "type": "object",
+          "required": ["enabled", "url", "testDestination", "controllerTokenSecretKey"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "url": {"type": "string"},
+            "testDestination": {"type": "string"},
+            "controllerTokenSecretKey": {"type": "string", "minLength": 1}
           }
         }
       }

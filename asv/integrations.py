@@ -213,18 +213,221 @@ class KafkaRestFenceProbe:
         )
 
 
+class CredentialBrokerProbe:
+    """Verifies grant denial and revocation through a synthetic credential broker."""
+
+    def __init__(
+        self,
+        base_url: str,
+        test_resource: str,
+        controller_token: str,
+        *,
+        transport: Transport | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.test_resource = test_resource
+        self.controller_token = controller_token
+        self.transport = transport or _urllib_transport
+
+    def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> HttpResult:
+        encoded = json.dumps(body).encode() if body is not None else None
+        return self.transport(
+            method,
+            f"{self.base_url}{path}",
+            {
+                "Authorization": f"Bearer {self.controller_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            encoded,
+        )
+
+    def probe(self, run: dict[str, Any]) -> ProbeObservation:
+        identity_ref = str(run["identity_ref"])
+        try:
+            grant = self._call(
+                "POST",
+                "/v1/grants",
+                {
+                    "subject_ref": identity_ref,
+                    "resource": self.test_resource,
+                    "run_id": run["run_id"],
+                    "purpose": "post-shutdown-verification",
+                },
+            )
+            credential = self._call(
+                "GET",
+                f"/v1/credentials/{urllib.parse.quote(identity_ref, safe='')}/status",
+            )
+        except Exception as error:
+            return ProbeObservation(
+                "credential", ProbeResult.UNKNOWN, {"error": str(error)},
+                "synthetic-credential-broker", "none",
+            )
+
+        grant_denied = grant.status in {401, 403}
+        grant_accepted = grant.status in {200, 201, 202, 204}
+        if credential.status in {401, 403, 404}:
+            active: bool | None = False
+        elif credential.status == 200 and isinstance(credential.body.get("active"), bool):
+            active = credential.body["active"]
+        else:
+            active = None
+
+        if grant_denied and active is False:
+            result = ProbeResult.PASS
+        elif grant_accepted or active is True:
+            result = ProbeResult.FAIL
+        else:
+            result = ProbeResult.UNKNOWN
+
+        observed = {
+            "grant_status": grant.status,
+            "credential_status": credential.status,
+            "credential_active": active,
+            "remaining_ttl_seconds": credential.body.get("remaining_ttl_seconds"),
+            "test_resource": self.test_resource,
+        }
+        return ProbeObservation(
+            "credential",
+            result,
+            observed,
+            "synthetic-credential-broker",
+            "deterministic" if result != ProbeResult.UNKNOWN else "none",
+        )
+
+    def fence(self, run: dict[str, Any]) -> dict[str, Any]:
+        result = self._call(
+            "POST",
+            "/v1/fences",
+            {
+                "subject_ref": run["identity_ref"],
+                "run_id": run["run_id"],
+                "deny_new_grants": True,
+                "revoke_existing": True,
+            },
+        )
+        if result.status not in {200, 201, 202, 204, 409}:
+            raise IntegrationError(f"credential fence returned {result.status}: {result.body}")
+        return {"accepted": True, "status": result.status}
+
+
+class EgressGatewayProbe:
+    """Tests new-request and existing-connection authority at an approved gateway."""
+
+    def __init__(
+        self,
+        base_url: str,
+        test_destination: str,
+        controller_token: str,
+        *,
+        transport: Transport | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.test_destination = test_destination
+        self.controller_token = controller_token
+        self.transport = transport or _urllib_transport
+
+    def _attempt(self, run: dict[str, Any], connection_mode: str) -> HttpResult:
+        body = json.dumps(
+            {
+                "run_id": run["run_id"],
+                "subject_ref": run["identity_ref"],
+                "destination": self.test_destination,
+                "connection_mode": connection_mode,
+            }
+        ).encode()
+        return self.transport(
+            "POST",
+            f"{self.base_url}/v1/probes/egress",
+            {
+                "Authorization": f"Bearer {self.controller_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            body,
+        )
+
+    @staticmethod
+    def _allowed(result: HttpResult) -> bool | None:
+        if result.status in {401, 403, 451}:
+            return False
+        if 200 <= result.status < 300 and isinstance(result.body.get("allowed"), bool):
+            return result.body["allowed"]
+        return None
+
+    def probe(self, run: dict[str, Any]) -> ProbeObservation:
+        try:
+            new_request = self._attempt(run, "new")
+            existing_connection = self._attempt(run, "existing")
+        except Exception as error:
+            return ProbeObservation(
+                "network", ProbeResult.UNKNOWN, {"error": str(error)},
+                "synthetic-egress-gateway", "none",
+            )
+        new_allowed = self._allowed(new_request)
+        existing_allowed = self._allowed(existing_connection)
+        if new_allowed is False and existing_allowed is False:
+            result = ProbeResult.PASS
+        elif new_allowed is True or existing_allowed is True:
+            result = ProbeResult.FAIL
+        else:
+            result = ProbeResult.UNKNOWN
+        return ProbeObservation(
+            "network",
+            result,
+            {
+                "new_request_status": new_request.status,
+                "new_request_allowed": new_allowed,
+                "existing_connection_status": existing_connection.status,
+                "existing_connection_allowed": existing_allowed,
+                "test_destination": self.test_destination,
+            },
+            "synthetic-egress-gateway",
+            "deterministic" if result != ProbeResult.UNKNOWN else "none",
+        )
+
+    def fence(self, run: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(
+            {
+                "run_id": run["run_id"],
+                "subject_ref": run["identity_ref"],
+                "destination": self.test_destination,
+                "block_new_connections": True,
+                "terminate_existing_connections": True,
+            }
+        ).encode()
+        result = self.transport(
+            "POST",
+            f"{self.base_url}/v1/fences",
+            {
+                "Authorization": f"Bearer {self.controller_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            body,
+        )
+        if result.status not in {200, 201, 202, 204, 409}:
+            raise IntegrationError(f"egress fence returned {result.status}: {result.body}")
+        return {"accepted": True, "status": result.status}
+
+
 class KubernetesKafkaAdapter:
     def __init__(
         self,
         kubernetes: KubernetesClient,
         allowed_namespaces: set[str],
         kafka: KafkaRestFenceProbe | None = None,
+        credential: CredentialBrokerProbe | None = None,
+        egress: EgressGatewayProbe | None = None,
     ) -> None:
         if not allowed_namespaces or any(not namespace.startswith("asv-") for namespace in allowed_namespaces):
             raise ValueError("allowed namespaces must be non-empty and use the asv-* prefix")
         self.kubernetes = kubernetes
         self.allowed_namespaces = allowed_namespaces
         self.kafka = kafka
+        self.credential = credential
+        self.egress = egress
 
     def _namespace(self, run: dict[str, Any]) -> str:
         namespace = str(run["agent"]["namespace"])
@@ -238,7 +441,16 @@ class KubernetesKafkaAdapter:
         cronjobs = self._related(namespace, "cronjobs", run["run_id"])
         for cronjob in cronjobs:
             self.kubernetes.suspend_cronjob(namespace, cronjob["metadata"]["name"])
-        return {"accepted": True, "namespace": namespace, "cronjobs_suspended": len(cronjobs)}
+        result: dict[str, Any] = {
+            "accepted": True,
+            "namespace": namespace,
+            "cronjobs_suspended": len(cronjobs),
+        }
+        if self.credential:
+            result["credential_broker"] = self.credential.fence(run)
+        if self.egress:
+            result["egress_gateway"] = self.egress.fence(run)
+        return result
 
     def stop_process(self, run: dict[str, Any]) -> dict[str, Any]:
         namespace = self._namespace(run)
@@ -278,6 +490,10 @@ class KubernetesKafkaAdapter:
                 return self._observation(kind, ProbeResult.PASS if not active else ProbeResult.FAIL, {"active_children": active})
             if kind == "kafka":
                 return self.kafka.probe(run) if self.kafka else self._observation(kind, ProbeResult.UNKNOWN, {"reason": "Kafka REST probe is not configured"}, "none")
+            if kind == "credential":
+                return self.credential.probe(run) if self.credential else self._observation(kind, ProbeResult.UNKNOWN, {"reason": "credential broker probe is not configured"}, "none")
+            if kind == "network":
+                return self.egress.probe(run) if self.egress else self._observation(kind, ProbeResult.UNKNOWN, {"reason": "egress gateway probe is not configured"}, "none")
             return self._observation(kind, ProbeResult.UNKNOWN, {"reason": f"{kind} probe is not configured"}, "none")
         except Exception as error:
             return self._observation(kind, ProbeResult.UNKNOWN, {"error": str(error)}, "none")

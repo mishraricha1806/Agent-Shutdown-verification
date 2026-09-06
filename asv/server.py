@@ -10,7 +10,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .auth import AuthenticationError, AuthorizationError, Principal, TokenAuthenticator
-from .integrations import KafkaRestFenceProbe, KubernetesClient, KubernetesKafkaAdapter
+from .integrations import (
+    CredentialBrokerProbe,
+    EgressGatewayProbe,
+    KafkaRestFenceProbe,
+    KubernetesClient,
+    KubernetesKafkaAdapter,
+)
 from .service import ConflictError, ControlPlane, NotFoundError, ValidationError
 from .store import Store
 
@@ -153,7 +159,28 @@ def build_server(
                 os.environ.get("ASV_KAFKA_CONSUMER_INSTANCE", "asv-fenced-probe-1"),
                 token,
             )
-        adapter = KubernetesKafkaAdapter(KubernetesClient.in_cluster(), namespaces, kafka)
+        credential = None
+        credential_url = os.environ.get("ASV_CREDENTIAL_BROKER_URL", "")
+        if credential_url:
+            credential_token = os.environ.get("ASV_CREDENTIAL_BROKER_TOKEN", "")
+            if not credential_token:
+                raise RuntimeError("ASV_CREDENTIAL_BROKER_TOKEN is required when credential probing is enabled")
+            credential = CredentialBrokerProbe(
+                credential_url,
+                os.environ.get("ASV_CREDENTIAL_TEST_RESOURCE", "asv.synthetic/resource"),
+                credential_token,
+            )
+        egress = None
+        egress_url = os.environ.get("ASV_EGRESS_GATEWAY_URL", "")
+        if egress_url:
+            egress_token = os.environ.get("ASV_EGRESS_GATEWAY_TOKEN", "")
+            destination = os.environ.get("ASV_EGRESS_TEST_DESTINATION", "")
+            if not egress_token or not destination:
+                raise RuntimeError("ASV_EGRESS_GATEWAY_TOKEN and ASV_EGRESS_TEST_DESTINATION are required when network probing is enabled")
+            egress = EgressGatewayProbe(egress_url, destination, egress_token)
+        adapter = KubernetesKafkaAdapter(
+            KubernetesClient.in_cluster(), namespaces, kafka, credential, egress
+        )
     elif adapter_mode != "safe-unknown":
         raise RuntimeError("ASV_ADAPTER_MODE must be safe-unknown or kubernetes")
     ApiHandler.control_plane = ControlPlane(

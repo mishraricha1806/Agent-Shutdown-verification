@@ -1,0 +1,43 @@
+# Example only: replace image, API CIDR, service labels, URLs, and destinations.
+image:
+  repository: ghcr.io/YOUR_ORG/agent-shutdown-verification
+  tag: "0.4.0"
+
+adapter:
+  mode: kubernetes
+  allowedNamespaces:
+    - asv-synthetic
+  kafkaRest:
+    enabled: true
+    url: https://kafka-rest.asv-synthetic.svc:8082
+    topic: asv.synthetic
+    consumerGroup: asv-fenced-probe
+    consumerInstance: asv-fenced-probe-1
+    bearerTokenSecretKey: kafka-bearer-token
+  credentialBroker:
+    enabled: true
+    url: https://credential-broker.asv-synthetic.svc:8443
+    testResource: asv.synthetic/resource
+    controllerTokenSecretKey: credential-broker-token
+  egressGateway:
+    enabled: true
+    url: https://egress-probe.asv-synthetic.svc:8443
+    testDestination: https://denied-target.asv-synthetic.svc/check
+    controllerTokenSecretKey: egress-gateway-token
+
+rbac:
+  kubernetesAdapter:
+    enabled: true
+
+networkPolicy:
+  kubernetesApiCIDR: 10.96.0.1/32
+  extraEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: asv-synthetic
+      ports:
+        - protocol: TCP
+          port: 8082
+        - protocol: TCP
+          port: 8443

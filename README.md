@@ -24,7 +24,7 @@ reported as `UNKNOWN` rather than being treated as successful containment.
 - [Local development](#local-development)
 - [Container image](#container-image)
 - [Kubernetes deployment](#kubernetes-deployment)
-- [Configure the Kubernetes and Kafka adapter](#configure-the-kubernetes-and-kafka-adapter)
+- [Configure infrastructure adapters](#configure-infrastructure-adapters)
 - [Operate a drill](#operate-a-drill)
 - [API and authorization](#api-and-authorization)
 - [Evidence and event export](#evidence-and-event-export)
@@ -42,14 +42,18 @@ reported as `UNKNOWN` rather than being treated as successful containment.
 - Recursively stops labeled Pods and Jobs and suspends CronJobs.
 - Creates deny-all Kubernetes NetworkPolicies for a run and its descendants.
 - Tests Kafka REST publish and consume denial with a synthetic fenced identity.
+- Requests credential fencing, verifies new grant rejection, and records whether
+  previously issued synthetic credentials remain active and for how long.
+- Requests egress fencing and independently verifies new-request and
+  existing-connection authority through an approved synthetic gateway.
 - Produces independent `PASS`, `FAIL`, `PARTIAL`, or `UNKNOWN` probe results.
 - Stores a per-run SHA-256 evidence chain and HMAC-signed manifest.
 - Exports lifecycle and probe events in a SIEM-ready JSON envelope.
 - Enforces signed, expiring service tokens and operator roles.
 - Ships as a non-root container and Helm chart with opt-in Kubernetes RBAC.
 
-Credential and general network-egress probes are placeholders that currently
-return `UNKNOWN`. They are scheduled for the next implementation phase.
+All external integrations are opt-in. Any adapter that is not configured or
+cannot return an unambiguous observation produces `UNKNOWN`.
 
 ## Architecture
 
@@ -95,8 +99,8 @@ See [the threat model](docs/threat-model.md) for abuse cases and unresolved risk
 | Tenant-scoped run registry | Implemented with SQLite |
 | Process and delegated-work probes | Implemented for labeled Kubernetes workloads |
 | Kafka publish and consume fencing | Implemented through Kafka REST Proxy |
-| Credential-revocation probe | Not implemented; reports `UNKNOWN` |
-| General egress probe | Not implemented; reports `UNKNOWN` |
+| Credential-revocation probe | Implemented through the synthetic broker contract |
+| General egress probe | Implemented through the synthetic gateway contract |
 | Evidence hash chain | Implemented |
 | Evidence signature | Development HMAC signer only |
 | Helm packaging and restricted RBAC | Implemented |
@@ -162,7 +166,7 @@ Build with the version in the Helm chart, scan the result, and publish it to an
 approved registry:
 
 ```bash
-export ASV_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification:0.3.0'
+export ASV_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification:0.4.0'
 docker build --pull --tag "$ASV_IMAGE" .
 docker image inspect "$ASV_IMAGE"
 docker push "$ASV_IMAGE"
@@ -195,6 +199,8 @@ The chart expects an existing Secret named `asv-secrets` with these keys:
 | `auth-secret` | Signs local service tokens | Yes |
 | `signing-key` | Signs evidence manifests | Yes |
 | `kafka-bearer-token` | Synthetic fenced Kafka identity | Only with Kafka probing |
+| `credential-broker-token` | Credential broker controller identity | Only with credential probing |
+| `egress-gateway-token` | Egress gateway controller identity | Only with network probing |
 
 Use your external secret operator or approved secret-management workflow in a
 shared environment. The following imperative command is for disposable local
@@ -217,7 +223,7 @@ helm lint deploy/helm/agent-shutdown-verification
 helm upgrade --install asv deploy/helm/agent-shutdown-verification \
   --namespace asv-system \
   --set image.repository=ghcr.io/YOUR_ORG/agent-shutdown-verification \
-  --set image.tag=0.3.0 \
+  --set image.tag=0.4.0 \
   --set persistence.enabled=true \
   --wait \
   --timeout 5m
@@ -233,7 +239,7 @@ helm test asv --namespace asv-system
 The SQLite deployment uses a `Recreate` strategy and exactly one replica. Do not
 increase `replicaCount`; the chart schema rejects any value other than `1`.
 
-## Configure the Kubernetes and Kafka adapter
+## Configure infrastructure adapters
 
 The runtime must apply the following label to the parent workload:
 
@@ -260,7 +266,7 @@ kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}'
 Copy and review the provided configuration:
 
 ```bash
-cp deploy/helm/agent-shutdown-verification/examples/values-week3.yaml values-lab.yaml
+cp deploy/helm/agent-shutdown-verification/examples/values-week4.yaml values-lab.yaml
 ```
 
 At minimum, replace:
@@ -268,6 +274,8 @@ At minimum, replace:
 - `image.repository`
 - `networkPolicy.kubernetesApiCIDR` with the API Service IP expressed as `/32`
 - Kafka REST URL, topic, group, instance, and scoped egress when Kafka is enabled
+- Credential broker URL, synthetic resource, controller token, and scoped egress
+- Egress gateway URL, test destination, controller token, and scoped egress
 
 Install only after confirming every `adapter.allowedNamespaces` entry is a
 disposable synthetic namespace:
@@ -283,11 +291,13 @@ helm upgrade --install asv deploy/helm/agent-shutdown-verification \
 ```
 
 The chart fails rendering when adapter mode and RBAC are inconsistent, when the
-Kubernetes API CIDR is missing, when Kafka egress is not explicit, or when a
+Kubernetes API CIDR is missing, when probe egress is not explicit, or when a
 target namespace does not use the `asv-*` prefix.
 
 For the detailed shutdown behavior and Kafka assumptions, read the
 [Kubernetes and Kafka adapter guide](docs/kubernetes-kafka-adapter.md).
+Credential and network contracts are specified in the
+[credential broker and egress gateway guide](docs/credential-egress-adapters.md).
 
 ## Operate a drill
 
@@ -518,6 +528,12 @@ post-drill cleanup procedure after evidence has been exported.
 | `ASV_KAFKA_CONSUMER_INSTANCE` | `asv-fenced-probe-1` | Pre-created test consumer instance |
 | `ASV_KAFKA_BEARER_TOKEN` | Empty | Synthetic fenced-identity token |
 | `ASV_KAFKA_TOKEN_FILE` | Empty | File alternative to the Kafka token variable |
+| `ASV_CREDENTIAL_BROKER_URL` | Empty | Enables the synthetic credential probe |
+| `ASV_CREDENTIAL_TEST_RESOURCE` | `asv.synthetic/resource` | Allowlisted grant target |
+| `ASV_CREDENTIAL_BROKER_TOKEN` | Empty | Credential broker controller token |
+| `ASV_EGRESS_GATEWAY_URL` | Empty | Enables the synthetic network probe |
+| `ASV_EGRESS_TEST_DESTINATION` | Empty | Allowlisted network target |
+| `ASV_EGRESS_GATEWAY_TOKEN` | Empty | Egress gateway controller token |
 
 The authoritative Helm defaults and validation constraints are in
 [values.yaml](deploy/helm/agent-shutdown-verification/values.yaml) and
@@ -536,7 +552,8 @@ drill:
   publish an offline verification tool and public key.
 - Encrypt evidence at rest with independently administered keys and immutable
   retention controls.
-- Implement synthetic credential issuance/revocation and general egress probes.
+- Validate credential and egress contracts against the selected enterprise
+  broker and gateway, including latency, expiry, and existing-connection tests.
 - Deliver lifecycle and probe events durably to Kafka and the customer SIEM.
 - Add metrics for fencing, termination, credential rejection, network denial,
   remaining jobs/actions, unknown probes, and evidence-integrity failures.

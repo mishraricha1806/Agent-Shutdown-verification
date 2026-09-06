@@ -10,6 +10,15 @@
 {{- if and .Values.adapter.kafkaRest.enabled (empty .Values.networkPolicy.extraEgress) }}
 {{- fail "networkPolicy.extraEgress must explicitly allow the Kafka REST endpoint when probing is enabled" }}
 {{- end }}
+{{- if and .Values.adapter.credentialBroker.enabled (ne .Values.adapter.mode "kubernetes") }}
+{{- fail "adapter.mode must be kubernetes when credential broker probing is enabled" }}
+{{- end }}
+{{- if and .Values.adapter.egressGateway.enabled (ne .Values.adapter.mode "kubernetes") }}
+{{- fail "adapter.mode must be kubernetes when egress gateway probing is enabled" }}
+{{- end }}
+{{- if and (or .Values.adapter.credentialBroker.enabled .Values.adapter.egressGateway.enabled) (empty .Values.networkPolicy.extraEgress) }}
+{{- fail "networkPolicy.extraEgress must explicitly allow configured Week 4 probe endpoints" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -86,6 +95,28 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.existingSecret }}
                   key: {{ .Values.adapter.kafkaRest.bearerTokenSecretKey }}
+            {{- end }}
+            {{- if .Values.adapter.credentialBroker.enabled }}
+            - name: ASV_CREDENTIAL_BROKER_URL
+              value: {{ required "adapter.credentialBroker.url is required when credential probing is enabled" .Values.adapter.credentialBroker.url | quote }}
+            - name: ASV_CREDENTIAL_TEST_RESOURCE
+              value: {{ .Values.adapter.credentialBroker.testResource | quote }}
+            - name: ASV_CREDENTIAL_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.adapter.credentialBroker.controllerTokenSecretKey }}
+            {{- end }}
+            {{- if .Values.adapter.egressGateway.enabled }}
+            - name: ASV_EGRESS_GATEWAY_URL
+              value: {{ required "adapter.egressGateway.url is required when network probing is enabled" .Values.adapter.egressGateway.url | quote }}
+            - name: ASV_EGRESS_TEST_DESTINATION
+              value: {{ required "adapter.egressGateway.testDestination is required when network probing is enabled" .Values.adapter.egressGateway.testDestination | quote }}
+            - name: ASV_EGRESS_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.adapter.egressGateway.controllerTokenSecretKey }}
             {{- end }}
           ports:
             - name: http
