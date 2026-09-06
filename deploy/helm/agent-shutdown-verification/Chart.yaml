@@ -2,6 +2,6 @@ apiVersion: v2
 name: agent-shutdown-verification
 description: Verification control plane for safe synthetic AI-agent shutdown drills
 type: application
-version: 0.3.0
-appVersion: "0.4.0"
+version: 0.4.0
+appVersion: "0.5.0"
 kubeVersion: ">=1.27.0-0"

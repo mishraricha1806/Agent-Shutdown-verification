@@ -21,7 +21,7 @@
     },
     "adapter": {
       "type": "object",
-      "required": ["mode", "allowedNamespaces", "kafkaRest", "credentialBroker", "egressGateway"],
+      "required": ["mode", "allowedNamespaces", "kafkaRest", "credentialBroker", "egressGateway", "restartGateway"],
       "properties": {
         "mode": {"enum": ["safe-unknown", "kubernetes"]},
         "allowedNamespaces": {
@@ -61,7 +61,26 @@
             "testDestination": {"type": "string"},
             "controllerTokenSecretKey": {"type": "string", "minLength": 1}
           }
+        },
+        "restartGateway": {
+          "type": "object",
+          "required": ["enabled", "url", "controllerTokenSecretKey"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "url": {"type": "string"},
+            "controllerTokenSecretKey": {"type": "string", "minLength": 1}
+          }
         }
+      }
+    },
+    "siem": {
+      "type": "object",
+      "required": ["enabled", "url", "bearerTokenSecretKey", "intervalSeconds"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "url": {"type": "string"},
+        "bearerTokenSecretKey": {"type": "string", "minLength": 1},
+        "intervalSeconds": {"type": "number", "minimum": 0.25, "maximum": 3600}
       }
     },
     "secrets": {
@@ -94,5 +113,5 @@
       }
     }
   },
-  "required": ["replicaCount", "image", "controller", "adapter", "secrets", "persistence", "rbac"]
+  "required": ["replicaCount", "image", "controller", "adapter", "siem", "secrets", "persistence", "rbac"]
 }

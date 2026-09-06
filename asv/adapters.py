@@ -10,6 +10,7 @@ class ShutdownAdapter(Protocol):
     def stop_process(self, run: dict) -> dict: ...
     def discover_children(self, run: dict) -> dict: ...
     def probe(self, kind: str, run: dict) -> ProbeObservation: ...
+    def restart(self, run: dict) -> ProbeObservation: ...
 
 
 class SafeUnknownAdapter:
@@ -31,6 +32,15 @@ class SafeUnknownAdapter:
             kind=kind,
             result=ProbeResult.UNKNOWN,
             observed={"reason": f"{kind} adapter is not configured"},
+            authority="control-plane",
+            confidence="none",
+        )
+
+    def restart(self, run: dict) -> ProbeObservation:
+        return ProbeObservation(
+            kind="restart",
+            result=ProbeResult.UNKNOWN,
+            observed={"reason": "no authorized restart adapter configured"},
             authority="control-plane",
             confidence="none",
         )
@@ -61,3 +71,16 @@ class SyntheticAdapter(SafeUnknownAdapter):
             confidence="deterministic",
         )
 
+    def restart(self, run: dict) -> ProbeObservation:
+        return ProbeObservation(
+            kind="restart",
+            result=self.outcomes.get("restart", ProbeResult.PASS),
+            observed={
+                "synthetic": True,
+                "restarted": True,
+                "policy_version": run["policy_version"],
+                "old_identity_active": False,
+            },
+            authority="synthetic-test-adapter",
+            confidence="deterministic",
+        )

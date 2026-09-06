@@ -48,7 +48,9 @@ reported as `UNKNOWN` rather than being treated as successful containment.
   existing-connection authority through an approved synthetic gateway.
 - Produces independent `PASS`, `FAIL`, `PARTIAL`, or `UNKNOWN` probe results.
 - Stores a per-run SHA-256 evidence chain and HMAC-signed manifest.
-- Exports lifecycle and probe events in a SIEM-ready JSON envelope.
+- Creates immutable signed JSON shutdown reports.
+- Persists lifecycle events to a transactional outbox and retries SIEM delivery.
+- Verifies authorized restart policy continuity and old-identity revocation.
 - Enforces signed, expiring service tokens and operator roles.
 - Ships as a non-root container and Helm chart with opt-in Kubernetes RBAC.
 
@@ -103,6 +105,9 @@ See [the threat model](docs/threat-model.md) for abuse cases and unresolved risk
 | General egress probe | Implemented through the synthetic gateway contract |
 | Evidence hash chain | Implemented |
 | Evidence signature | Development HMAC signer only |
+| Signed JSON report | Implemented and cached per terminal run |
+| Durable SIEM delivery | Transactional outbox with at-least-once HTTP delivery |
+| Authorized restart probe | Implemented through the restart gateway contract |
 | Helm packaging and restricted RBAC | Implemented |
 | High availability and restart recovery | Not implemented |
 
@@ -166,7 +171,7 @@ Build with the version in the Helm chart, scan the result, and publish it to an
 approved registry:
 
 ```bash
-export ASV_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification:0.4.0'
+export ASV_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification:0.5.0'
 docker build --pull --tag "$ASV_IMAGE" .
 docker image inspect "$ASV_IMAGE"
 docker push "$ASV_IMAGE"
@@ -201,6 +206,8 @@ The chart expects an existing Secret named `asv-secrets` with these keys:
 | `kafka-bearer-token` | Synthetic fenced Kafka identity | Only with Kafka probing |
 | `credential-broker-token` | Credential broker controller identity | Only with credential probing |
 | `egress-gateway-token` | Egress gateway controller identity | Only with network probing |
+| `restart-gateway-token` | Authorized restart controller identity | Only with restart probing |
+| `siem-bearer-token` | SIEM ingestion identity | Only with SIEM delivery |
 
 Use your external secret operator or approved secret-management workflow in a
 shared environment. The following imperative command is for disposable local
@@ -223,7 +230,7 @@ helm lint deploy/helm/agent-shutdown-verification
 helm upgrade --install asv deploy/helm/agent-shutdown-verification \
   --namespace asv-system \
   --set image.repository=ghcr.io/YOUR_ORG/agent-shutdown-verification \
-  --set image.tag=0.4.0 \
+  --set image.tag=0.5.0 \
   --set persistence.enabled=true \
   --wait \
   --timeout 5m
@@ -266,7 +273,7 @@ kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}'
 Copy and review the provided configuration:
 
 ```bash
-cp deploy/helm/agent-shutdown-verification/examples/values-week4.yaml values-lab.yaml
+cp deploy/helm/agent-shutdown-verification/examples/values-week5.yaml values-lab.yaml
 ```
 
 At minimum, replace:
@@ -298,6 +305,8 @@ For the detailed shutdown behavior and Kafka assumptions, read the
 [Kubernetes and Kafka adapter guide](docs/kubernetes-kafka-adapter.md).
 Credential and network contracts are specified in the
 [credential broker and egress gateway guide](docs/credential-egress-adapters.md).
+Report, outbox delivery, and restart semantics are specified in the
+[Week 5 operations guide](docs/report-siem-restart.md).
 
 ## Operate a drill
 
@@ -396,6 +405,16 @@ curl --fail --silent --show-error \
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/runs/RUN_UUID/events \
   -H "Authorization: Bearer $TOKEN"
+
+curl --fail --silent --show-error \
+  -X POST http://127.0.0.1:8080/v1/runs/RUN_UUID/restart \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{}'
+
+curl --fail --silent --show-error \
+  http://127.0.0.1:8080/v1/runs/RUN_UUID/report \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 Interpret terminal states conservatively:
@@ -418,6 +437,8 @@ Interpret terminal states conservatively:
 | `GET /v1/runs/{runId}` | Any operator role | Read state, probes, and delegated jobs |
 | `GET /v1/runs/{runId}/evidence` | Any operator role | Read evidence records and signed manifest |
 | `GET /v1/runs/{runId}/events` | Any operator role | Export SIEM event envelopes |
+| `POST /v1/runs/{runId}/restart` | `responder` | Execute the authorized restart probe |
+| `GET /v1/runs/{runId}/report` | Any operator role | Retrieve the immutable signed report |
 | `GET /healthz` | None | Kubernetes liveness and readiness check |
 
 The supported roles are:
@@ -534,6 +555,11 @@ post-drill cleanup procedure after evidence has been exported.
 | `ASV_EGRESS_GATEWAY_URL` | Empty | Enables the synthetic network probe |
 | `ASV_EGRESS_TEST_DESTINATION` | Empty | Allowlisted network target |
 | `ASV_EGRESS_GATEWAY_TOKEN` | Empty | Egress gateway controller token |
+| `ASV_RESTART_GATEWAY_URL` | Empty | Enables the authorized restart probe |
+| `ASV_RESTART_GATEWAY_TOKEN` | Empty | Restart gateway controller token |
+| `ASV_SIEM_URL` | Empty | Enables background outbox delivery |
+| `ASV_SIEM_BEARER_TOKEN` | Empty | SIEM ingestion token |
+| `ASV_SIEM_INTERVAL_SECONDS` | `5` | Pending-event polling interval |
 
 The authoritative Helm defaults and validation constraints are in
 [values.yaml](deploy/helm/agent-shutdown-verification/values.yaml) and
@@ -554,7 +580,8 @@ drill:
   retention controls.
 - Validate credential and egress contracts against the selected enterprise
   broker and gateway, including latency, expiry, and existing-connection tests.
-- Deliver lifecycle and probe events durably to Kafka and the customer SIEM.
+- Replace the single-process HTTP outbox worker with a horizontally safe delivery
+  service, add backoff/dead-letter handling, and add durable Kafka publication.
 - Add metrics for fencing, termination, credential rejection, network denial,
   remaining jobs/actions, unknown probes, and evidence-integrity failures.
 - Add admission policies that reject privileged workloads and host-path mounts.

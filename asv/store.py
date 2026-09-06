@@ -80,6 +80,24 @@ CREATE TABLE IF NOT EXISTS evidence (
   correlation_id TEXT NOT NULL,
   UNIQUE(run_id, sequence_no)
 );
+CREATE TABLE IF NOT EXISTS event_outbox (
+  event_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  last_error TEXT NULL,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT NULL
+);
+CREATE TABLE IF NOT EXISTS report (
+  run_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  generated_at TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  signature TEXT NOT NULL
+);
 """
 
 

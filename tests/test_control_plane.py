@@ -138,6 +138,35 @@ class ControlPlaneTest(unittest.TestCase):
         for previous, current in zip(evidence["records"], evidence["records"][1:]):
             self.assertEqual(previous["payload_hash"], current["previous_hash"])
 
+    def test_restart_probe_and_signed_report_are_idempotent(self):
+        run = self.make_run()
+        self.control.request_shutdown(
+            "tenant-a", run["run_id"], actor="operator", idempotency_key="stop-report", asynchronous=False
+        )
+        restart = self.control.request_restart("tenant-a", run["run_id"], "responder")
+        repeated_restart = self.control.request_restart("tenant-a", run["run_id"], "responder")
+        self.assertEqual("PASS", restart["result"])
+        self.assertEqual(restart["result"], repeated_restart["result"])
+
+        first_report = self.control.report("tenant-a", run["run_id"])
+        second_report = self.control.report("tenant-a", run["run_id"])
+        self.assertEqual(first_report, second_report)
+        self.assertEqual("VERIFIED", first_report["report"]["shutdown_state"])
+        self.assertEqual("PASS", first_report["report"]["probe_results"]["restart"])
+        self.assertEqual("hmac-sha256", first_report["signature"]["algorithm"])
+        self.assertTrue(
+            self.control.ledger.verify_signed_payload(
+                first_report["report"], first_report["signature"]
+            )
+        )
+        events = self.control.export_events("tenant-a", run["run_id"])["events"]
+        self.assertEqual(1, sum(event["event_type"] == "shutdown.report.signed" for event in events))
+
+    def test_report_requires_terminal_shutdown(self):
+        run = self.make_run()
+        with self.assertRaises(ConflictError):
+            self.control.report("tenant-a", run["run_id"])
+
     def test_synthetic_drill_runs_end_to_end_and_exports_event_schema(self):
         agent = self.agent()
         drill = self.control.start_synthetic_drill(

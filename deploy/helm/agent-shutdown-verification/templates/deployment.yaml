@@ -19,6 +19,12 @@
 {{- if and (or .Values.adapter.credentialBroker.enabled .Values.adapter.egressGateway.enabled) (empty .Values.networkPolicy.extraEgress) }}
 {{- fail "networkPolicy.extraEgress must explicitly allow configured Week 4 probe endpoints" }}
 {{- end }}
+{{- if and .Values.adapter.restartGateway.enabled (ne .Values.adapter.mode "kubernetes") }}
+{{- fail "adapter.mode must be kubernetes when restart probing is enabled" }}
+{{- end }}
+{{- if and (or .Values.adapter.restartGateway.enabled .Values.siem.enabled) (empty .Values.networkPolicy.extraEgress) }}
+{{- fail "networkPolicy.extraEgress must explicitly allow configured Week 5 endpoints" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -117,6 +123,26 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.existingSecret }}
                   key: {{ .Values.adapter.egressGateway.controllerTokenSecretKey }}
+            {{- end }}
+            {{- if .Values.adapter.restartGateway.enabled }}
+            - name: ASV_RESTART_GATEWAY_URL
+              value: {{ required "adapter.restartGateway.url is required when restart probing is enabled" .Values.adapter.restartGateway.url | quote }}
+            - name: ASV_RESTART_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.adapter.restartGateway.controllerTokenSecretKey }}
+            {{- end }}
+            {{- if .Values.siem.enabled }}
+            - name: ASV_SIEM_URL
+              value: {{ required "siem.url is required when SIEM delivery is enabled" .Values.siem.url | quote }}
+            - name: ASV_SIEM_INTERVAL_SECONDS
+              value: {{ .Values.siem.intervalSeconds | quote }}
+            - name: ASV_SIEM_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.siem.bearerTokenSecretKey }}
             {{- end }}
           ports:
             - name: http

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import threading
@@ -9,8 +10,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .adapters import SafeUnknownAdapter, ShutdownAdapter, SyntheticAdapter
-from .domain import PROBE_KINDS, ProbeResult, ShutdownState, aggregate_probe_results
-from .evidence import EvidenceLedger
+from .domain import PROBE_KINDS, TERMINAL_STATES, ProbeResult, ShutdownState, aggregate_probe_results
+from .evidence import EvidenceLedger, canonical_json
 from .store import Store, utc_now
 
 
@@ -43,6 +44,7 @@ class ControlPlane:
         self.adapter = adapter or SafeUnknownAdapter()
         self.deadline_seconds = deadline_seconds
         self._shutdown_lock = threading.RLock()
+        self._report_lock = threading.RLock()
 
     def register_agent(self, request: dict[str, Any]) -> dict[str, Any]:
         required = ("tenant_id", "name", "image_digest", "namespace", "scope_owner")
@@ -264,7 +266,13 @@ class ControlPlane:
         run["stopped_at"] = stopped_at or run.get("stopped_at")
         self._append_event(run, event_type, {"state": state.value, **payload}, actor)
 
-    def _save_probe(self, run: dict[str, Any], observation: Any) -> None:
+    def _save_probe(
+        self,
+        run: dict[str, Any],
+        observation: Any,
+        event_type: str = "shutdown.probe.result",
+        actor: str = "probe-runner",
+    ) -> None:
         requested_at = utc_now()
         with self.store.connection() as connection:
             connection.execute(
@@ -276,7 +284,7 @@ class ControlPlane:
                     observation.authority, observation.confidence,
                 ),
             )
-        self._append_event(run, "shutdown.probe.result", observation.to_dict(), "probe-runner")
+        self._append_event(run, event_type, observation.to_dict(), actor)
 
     def _save_delegated_jobs(self, run: dict[str, Any], children: list[dict[str, Any]]) -> None:
         with self.store.connection() as connection:
@@ -333,6 +341,59 @@ class ControlPlane:
                 }
             )
         return {"events": events, "count": len(events)}
+
+    def request_restart(self, tenant_id: str, run_id: str, actor: str) -> dict[str, Any]:
+        run = self._adapter_run(tenant_id, run_id)
+        if ShutdownState(run["state"]) not in TERMINAL_STATES:
+            raise ConflictError("restart probe requires a terminal shutdown state")
+        existing = [probe for probe in run["probes"] if probe["kind"] == "restart"]
+        if existing:
+            return existing[-1]
+        observation = self.adapter.restart(run)
+        self._save_probe(run, observation, "shutdown.restart.probe.result", actor)
+        return observation.to_dict()
+
+    def report(self, tenant_id: str, run_id: str) -> dict[str, Any]:
+        with self._report_lock:
+            with self.store.connection() as connection:
+                existing = connection.execute(
+                    "SELECT payload,signature FROM report WHERE tenant_id=? AND run_id=?",
+                    (tenant_id, run_id),
+                ).fetchone()
+            if existing:
+                return {"report": json.loads(existing["payload"]), "signature": json.loads(existing["signature"])}
+            run = self.get_run(tenant_id, run_id)
+            if ShutdownState(run["state"]) not in TERMINAL_STATES:
+                raise ConflictError("report is available only after shutdown reaches a terminal state")
+            evidence = self.evidence(tenant_id, run_id)
+            report = {
+                "report_version": "1.0",
+                "generated_at": utc_now(),
+                "tenant_id": tenant_id,
+                "run_id": run_id,
+                "agent_id": run["agent_id"],
+                "correlation_id": run["correlation_id"],
+                "policy_version": run["policy_version"],
+                "shutdown_state": run["state"],
+                "started_at": run["started_at"],
+                "stopped_at": run["stopped_at"],
+                "probe_results": {probe["kind"]: probe["result"] for probe in run["probes"]},
+                "delegated_jobs": run["delegated_jobs"],
+                "evidence_manifest": evidence["manifest"],
+            }
+            signature = self.ledger.sign_payload(report)
+            with self.store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO report VALUES (?,?,?,?,?)",
+                    (run_id, tenant_id, report["generated_at"], canonical_json(report), canonical_json(signature)),
+                )
+            self._append_event(
+                run,
+                "shutdown.report.signed",
+                {"report_hash": hashlib.sha256(canonical_json(report).encode()).hexdigest(), "key_id": signature["key_id"]},
+                actor="evidence-writer",
+            )
+            return {"report": report, "signature": signature}
 
     def start_synthetic_drill(
         self,

@@ -65,6 +65,31 @@ class EvidenceLedger:
                     policy_version, correlation_id,
                 ),
             )
+            run = connection.execute(
+                "SELECT agent_id,parent_run_id FROM run WHERE tenant_id=? AND run_id=?",
+                (tenant_id, run_id),
+            ).fetchone()
+            event = {
+                "event_id": record["evidence_id"],
+                "run_id": run_id,
+                "parent_run_id": run["parent_run_id"],
+                "agent_id": run["agent_id"],
+                "correlation_id": correlation_id,
+                "policy_version": policy_version,
+                "occurred_at": record["observed_at"],
+                "producer": actor,
+                "schema_version": "1.0",
+                "idempotency_key": f"{run_id}:{sequence}",
+                "event_type": event_type,
+                "payload": payload,
+            }
+            connection.execute(
+                "INSERT INTO event_outbox VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    event["event_id"], tenant_id, run_id, canonical_json(event),
+                    "PENDING", 0, None, record["observed_at"], None,
+                ),
+            )
         return record
 
     def records(self, tenant_id: str, run_id: str) -> list[dict[str, Any]]:
@@ -99,6 +124,23 @@ class EvidenceLedger:
             self.signing_key, canonical_json(unsigned).encode(), hashlib.sha256
         ).hexdigest()
         return hmac.compare_digest(expected, str(manifest.get("signature", "")))
+
+    def sign_payload(self, payload: dict[str, Any]) -> dict[str, str]:
+        return {
+            "algorithm": "hmac-sha256",
+            "key_id": "local-dev-hmac-v1",
+            "signature": hmac.new(
+                self.signing_key, canonical_json(payload).encode(), hashlib.sha256
+            ).hexdigest(),
+        }
+
+    def verify_signed_payload(self, payload: dict[str, Any], signature: dict[str, str]) -> bool:
+        if signature.get("algorithm") != "hmac-sha256":
+            return False
+        expected = hmac.new(
+            self.signing_key, canonical_json(payload).encode(), hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature.get("signature", ""))
 
     @staticmethod
     def verify_chain(records: list[dict[str, Any]]) -> tuple[bool, str | None]:

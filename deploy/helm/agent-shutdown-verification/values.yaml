@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/example/agent-shutdown-verification
-  tag: "0.4.0"
+  tag: "0.5.0"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -48,6 +48,16 @@ adapter:
     url: ""
     testDestination: ""
     controllerTokenSecretKey: egress-gateway-token
+  restartGateway:
+    enabled: false
+    url: ""
+    controllerTokenSecretKey: restart-gateway-token
+
+siem:
+  enabled: false
+  url: ""
+  bearerTokenSecretKey: siem-bearer-token
+  intervalSeconds: 5
 
 secrets:
   # Pre-create this Secret. The chart never stores secret material in values.

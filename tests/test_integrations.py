@@ -12,6 +12,7 @@ from asv.integrations import (
     KubernetesKafkaAdapter,
     PARENT_RUN_LABEL,
     RUN_LABEL,
+    RestartGatewayProbe,
 )
 from asv.service import ControlPlane
 from asv.store import Store
@@ -274,6 +275,45 @@ class EgressGatewayProbeTest(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertTrue(calls[0][3]["block_new_connections"])
         self.assertTrue(calls[0][3]["terminate_existing_connections"])
+
+
+class RestartGatewayProbeTest(unittest.TestCase):
+    def probe(self, body, status=200):
+        calls = []
+
+        def transport(method, url, headers, request_body):
+            calls.append((method, url, headers, json.loads(request_body)))
+            return HttpResult(status, body)
+
+        probe = RestartGatewayProbe("https://restart.example.test", "token", transport=transport)
+        run = {**RUN, "agent_id": "agent-1", "policy_version": 7}
+        return probe.probe(run), calls
+
+    def test_restart_passes_only_with_same_policy_new_identity_and_old_revoked(self):
+        observation, calls = self.probe(
+            {
+                "restarted": True,
+                "policy_version": 7,
+                "old_identity_active": False,
+                "new_identity_ref": "synthetic/new-identity",
+            }
+        )
+        self.assertEqual(ProbeResult.PASS, observation.result)
+        self.assertEqual("restart:12345678-1234-1234-1234-123456789abc", calls[0][2]["Idempotency-Key"])
+
+    def test_old_authority_or_changed_policy_fails_restart(self):
+        old_active, _ = self.probe(
+            {"restarted": True, "policy_version": 7, "old_identity_active": True, "new_identity_ref": "new"}
+        )
+        changed_policy, _ = self.probe(
+            {"restarted": True, "policy_version": 8, "old_identity_active": False, "new_identity_ref": "new"}
+        )
+        self.assertEqual(ProbeResult.FAIL, old_active.result)
+        self.assertEqual(ProbeResult.FAIL, changed_policy.result)
+
+    def test_incomplete_restart_observation_is_unknown(self):
+        observation, _ = self.probe({"restarted": True})
+        self.assertEqual(ProbeResult.UNKNOWN, observation.result)
 
 
 if __name__ == "__main__":

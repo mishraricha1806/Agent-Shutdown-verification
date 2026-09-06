@@ -412,6 +412,70 @@ class EgressGatewayProbe:
         return {"accepted": True, "status": result.status}
 
 
+class RestartGatewayProbe:
+    """Requests an authorized restart and verifies policy and identity continuity."""
+
+    def __init__(
+        self, base_url: str, controller_token: str, *, transport: Transport | None = None
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.controller_token = controller_token
+        self.transport = transport or _urllib_transport
+
+    def probe(self, run: dict[str, Any]) -> ProbeObservation:
+        request_body = {
+            "run_id": run["run_id"],
+            "agent_id": run["agent_id"],
+            "expected_policy_version": run["policy_version"],
+            "old_identity_ref": run["identity_ref"],
+            "require_new_identity": True,
+        }
+        try:
+            result = self.transport(
+                "POST",
+                f"{self.base_url}/v1/restarts",
+                {
+                    "Authorization": f"Bearer {self.controller_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": f"restart:{run['run_id']}",
+                },
+                json.dumps(request_body).encode(),
+            )
+        except Exception as error:
+            return ProbeObservation(
+                "restart", ProbeResult.UNKNOWN, {"error": str(error)},
+                "authorized-restart-gateway", "none",
+            )
+        if result.status not in {200, 201, 202}:
+            outcome = ProbeResult.UNKNOWN
+        else:
+            restarted = result.body.get("restarted")
+            policy_version = result.body.get("policy_version")
+            old_identity_active = result.body.get("old_identity_active")
+            new_identity_ref = result.body.get("new_identity_ref")
+            complete = (
+                isinstance(restarted, bool)
+                and isinstance(policy_version, int)
+                and isinstance(old_identity_active, bool)
+                and isinstance(new_identity_ref, str)
+                and bool(new_identity_ref)
+            )
+            if not complete:
+                outcome = ProbeResult.UNKNOWN
+            elif restarted and policy_version == run["policy_version"] and not old_identity_active and new_identity_ref != run["identity_ref"]:
+                outcome = ProbeResult.PASS
+            else:
+                outcome = ProbeResult.FAIL
+        return ProbeObservation(
+            "restart",
+            outcome,
+            {"http_status": result.status, **result.body},
+            "authorized-restart-gateway",
+            "deterministic" if outcome != ProbeResult.UNKNOWN else "none",
+        )
+
+
 class KubernetesKafkaAdapter:
     def __init__(
         self,
@@ -420,6 +484,7 @@ class KubernetesKafkaAdapter:
         kafka: KafkaRestFenceProbe | None = None,
         credential: CredentialBrokerProbe | None = None,
         egress: EgressGatewayProbe | None = None,
+        restart_gateway: RestartGatewayProbe | None = None,
     ) -> None:
         if not allowed_namespaces or any(not namespace.startswith("asv-") for namespace in allowed_namespaces):
             raise ValueError("allowed namespaces must be non-empty and use the asv-* prefix")
@@ -428,6 +493,7 @@ class KubernetesKafkaAdapter:
         self.kafka = kafka
         self.credential = credential
         self.egress = egress
+        self.restart_gateway = restart_gateway
 
     def _namespace(self, run: dict[str, Any]) -> str:
         namespace = str(run["agent"]["namespace"])
@@ -497,6 +563,15 @@ class KubernetesKafkaAdapter:
             return self._observation(kind, ProbeResult.UNKNOWN, {"reason": f"{kind} probe is not configured"}, "none")
         except Exception as error:
             return self._observation(kind, ProbeResult.UNKNOWN, {"error": str(error)}, "none")
+
+    def restart(self, run: dict[str, Any]) -> ProbeObservation:
+        self._namespace(run)
+        if not self.restart_gateway:
+            return self._observation(
+                "restart", ProbeResult.UNKNOWN,
+                {"reason": "authorized restart gateway is not configured"}, "none",
+            )
+        return self.restart_gateway.probe(run)
 
     @staticmethod
     def _child_active(child: dict[str, Any]) -> bool:

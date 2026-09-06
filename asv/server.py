@@ -16,8 +16,10 @@ from .integrations import (
     KafkaRestFenceProbe,
     KubernetesClient,
     KubernetesKafkaAdapter,
+    RestartGatewayProbe,
 )
 from .service import ConflictError, ControlPlane, NotFoundError, ValidationError
+from .siem import HttpSiemSink, OutboxPublisher
 from .store import Store
 
 
@@ -25,6 +27,8 @@ RUN_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)$")
 SHUTDOWN_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/shutdown$")
 EVIDENCE_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/evidence$")
 EVENTS_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/events$")
+REPORT_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/report$")
+RESTART_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/restart$")
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -59,6 +63,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self._send(HTTPStatus.ACCEPTED, result)
                 return
+            match = RESTART_PATH.fullmatch(urlparse(self.path).path)
+            if match:
+                self.authenticator.require_role(principal, "responder")
+                result = self.control_plane.request_restart(
+                    principal.tenant_id, match.group(1), principal.actor
+                )
+                self._send(HTTPStatus.OK, result)
+                return
             self._send(HTTPStatus.NOT_FOUND, {"error": "route not found"})
         except Exception as error:
             self._send_error(error)
@@ -82,6 +94,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             match = EVENTS_PATH.fullmatch(parsed.path)
             if match:
                 self._send(HTTPStatus.OK, self.control_plane.export_events(principal.tenant_id, match.group(1)))
+                return
+            match = REPORT_PATH.fullmatch(parsed.path)
+            if match:
+                self._send(HTTPStatus.OK, self.control_plane.report(principal.tenant_id, match.group(1)))
                 return
             self._send(HTTPStatus.NOT_FOUND, {"error": "route not found"})
         except Exception as error:
@@ -178,8 +194,15 @@ def build_server(
             if not egress_token or not destination:
                 raise RuntimeError("ASV_EGRESS_GATEWAY_TOKEN and ASV_EGRESS_TEST_DESTINATION are required when network probing is enabled")
             egress = EgressGatewayProbe(egress_url, destination, egress_token)
+        restart_gateway = None
+        restart_url = os.environ.get("ASV_RESTART_GATEWAY_URL", "")
+        if restart_url:
+            restart_token = os.environ.get("ASV_RESTART_GATEWAY_TOKEN", "")
+            if not restart_token:
+                raise RuntimeError("ASV_RESTART_GATEWAY_TOKEN is required when restart probing is enabled")
+            restart_gateway = RestartGatewayProbe(restart_url, restart_token)
         adapter = KubernetesKafkaAdapter(
-            KubernetesClient.in_cluster(), namespaces, kafka, credential, egress
+            KubernetesClient.in_cluster(), namespaces, kafka, credential, egress, restart_gateway
         )
     elif adapter_mode != "safe-unknown":
         raise RuntimeError("ASV_ADAPTER_MODE must be safe-unknown or kubernetes")
@@ -187,7 +210,17 @@ def build_server(
         store, signing_key=signing_key, adapter=adapter, deadline_seconds=deadline_seconds
     )
     ApiHandler.authenticator = TokenAuthenticator(auth_secret)
-    return ThreadingHTTPServer((host, port), ApiHandler)
+    server = ThreadingHTTPServer((host, port), ApiHandler)
+    siem_url = os.environ.get("ASV_SIEM_URL", "")
+    if siem_url:
+        siem_token = os.environ.get("ASV_SIEM_BEARER_TOKEN", "")
+        if not siem_token:
+            raise RuntimeError("ASV_SIEM_BEARER_TOKEN is required when SIEM delivery is enabled")
+        publisher = OutboxPublisher(store, HttpSiemSink(siem_url, siem_token).send)
+        server.outbox_thread = publisher.start(  # type: ignore[attr-defined]
+            float(os.environ.get("ASV_SIEM_INTERVAL_SECONDS", "5"))
+        )
+    return server
 
 
 def main() -> None:
