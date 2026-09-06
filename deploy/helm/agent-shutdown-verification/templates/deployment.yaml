@@ -1,0 +1,140 @@
+{{- if and (eq .Values.adapter.mode "kubernetes") (not .Values.rbac.kubernetesAdapter.enabled) }}
+{{- fail "rbac.kubernetesAdapter.enabled must be true when adapter.mode=kubernetes" }}
+{{- end }}
+{{- if and .Values.rbac.kubernetesAdapter.enabled (ne .Values.adapter.mode "kubernetes") }}
+{{- fail "adapter.mode must be kubernetes when Kubernetes RBAC is enabled" }}
+{{- end }}
+{{- if and .Values.adapter.kafkaRest.enabled (ne .Values.adapter.mode "kubernetes") }}
+{{- fail "adapter.mode must be kubernetes when Kafka REST probing is enabled" }}
+{{- end }}
+{{- if and .Values.adapter.kafkaRest.enabled (empty .Values.networkPolicy.extraEgress) }}
+{{- fail "networkPolicy.extraEgress must explicitly allow the Kafka REST endpoint when probing is enabled" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "asv.fullname" . }}
+  labels:
+    {{- include "asv.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "asv.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "asv.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "asv.controllerServiceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.rbac.kubernetesAdapter.enabled }}
+      terminationGracePeriodSeconds: {{ .Values.controller.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --database
+            - /data/asv.db
+            - --deadline-seconds
+            - {{ .Values.controller.deadlineSeconds | quote }}
+          env:
+            - name: ASV_ADAPTER_MODE
+              value: {{ .Values.adapter.mode | quote }}
+            - name: ASV_ALLOWED_NAMESPACES
+              value: {{ join "," .Values.adapter.allowedNamespaces | quote }}
+            - name: ASV_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.authSecretKey }}
+            - name: ASV_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.signingKeyKey }}
+            {{- if .Values.adapter.kafkaRest.enabled }}
+            - name: ASV_KAFKA_REST_URL
+              value: {{ required "adapter.kafkaRest.url is required when Kafka REST probing is enabled" .Values.adapter.kafkaRest.url | quote }}
+            - name: ASV_KAFKA_TOPIC
+              value: {{ .Values.adapter.kafkaRest.topic | quote }}
+            - name: ASV_KAFKA_CONSUMER_GROUP
+              value: {{ .Values.adapter.kafkaRest.consumerGroup | quote }}
+            - name: ASV_KAFKA_CONSUMER_INSTANCE
+              value: {{ .Values.adapter.kafkaRest.consumerInstance | quote }}
+            - name: ASV_KAFKA_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.adapter.kafkaRest.bearerTokenSecretKey }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "asv.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

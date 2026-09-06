@@ -1,0 +1,14 @@
+1. The API is reachable inside the cluster at:
+   http://{{ include "asv.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+2. Port-forward for local evaluation:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "asv.fullname" . }} 8080:{{ .Values.service.port }}
+
+3. Issue a local service token with the same ASV_AUTH_SECRET used by the Secret:
+   python3 -m asv.auth --tenant demo --actor operator@example.com --roles drill_author,responder,auditor
+
+The Kubernetes adapter RBAC is disabled by default. The deployed controller will
+return UNKNOWN for external probes until a real adapter is configured.
+
+When enabling adapter.mode=kubernetes, also enable rbac.kubernetesAdapter and
+set networkPolicy.kubernetesApiCIDR to the API Service ClusterIP as a /32.

@@ -1,0 +1,35 @@
+# Example only: replace the image registry and cluster-specific API CIDR.
+image:
+  repository: ghcr.io/YOUR_ORG/agent-shutdown-verification
+  tag: "0.3.0"
+
+adapter:
+  mode: kubernetes
+  allowedNamespaces:
+    - asv-synthetic
+  kafkaRest:
+    enabled: true
+    url: https://kafka-rest.asv-synthetic.svc:8082
+    topic: asv.synthetic
+    consumerGroup: asv-fenced-probe
+    consumerInstance: asv-fenced-probe-1
+    bearerTokenSecretKey: kafka-bearer-token
+
+rbac:
+  kubernetesAdapter:
+    enabled: true
+
+networkPolicy:
+  kubernetesApiCIDR: 10.96.0.1/32
+  extraEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: asv-synthetic
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka-rest
+      ports:
+        - protocol: TCP
+          port: 8082
+

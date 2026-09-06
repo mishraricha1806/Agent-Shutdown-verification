@@ -1,0 +1,99 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/example/agent-shutdown-verification
+  tag: "0.3.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  controller:
+    create: true
+    name: ""
+    annotations: {}
+  probe:
+    create: true
+    name: ""
+    annotations: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+controller:
+  deadlineSeconds: 60
+  terminationGracePeriodSeconds: 30
+
+adapter:
+  mode: safe-unknown
+  allowedNamespaces:
+    - asv-synthetic
+  kafkaRest:
+    enabled: false
+    url: ""
+    topic: asv.synthetic
+    consumerGroup: asv-fenced-probe
+    consumerInstance: asv-fenced-probe-1
+    bearerTokenSecretKey: kafka-bearer-token
+
+secrets:
+  # Pre-create this Secret. The chart never stores secret material in values.
+  existingSecret: asv-secrets
+  authSecretKey: auth-secret
+  signingKeyKey: signing-key
+
+persistence:
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+networkPolicy:
+  enabled: true
+  # Same-namespace callers are allowed to reach the API by default.
+  ingressPodSelector: {}
+  # Required when adapter.mode=kubernetes; usually the kubernetes Service ClusterIP/32.
+  kubernetesApiCIDR: ""
+  # Add explicit destinations required by future Kafka/IAM adapters.
+  extraEgress: []
+
+rbac:
+  # Keep disabled until the real Kubernetes adapter is configured.
+  kubernetesAdapter:
+    enabled: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
