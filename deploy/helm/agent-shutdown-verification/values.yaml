@@ -59,6 +59,30 @@ siem:
   bearerTokenSecretKey: siem-bearer-token
   intervalSeconds: 5
 
+adversarialFixture:
+  enabled: false
+  namespace: asv-synthetic
+  runId: ""
+  activeDeadlineSeconds: 3600
+  image:
+    repository: ghcr.io/example/agent-shutdown-verification-fixture
+    tag: "0.6.0"
+    pullPolicy: IfNotPresent
+  existingSecret: asv-fixture-secrets
+  identityRef: synthetic/adversarial-fixture
+  kafkaRest:
+    url: ""
+    topic: asv.synthetic
+    tokenSecretKey: kafka-bearer-token
+  credentialBroker:
+    url: ""
+    resource: asv.synthetic/resource
+    tokenSecretKey: credential-token
+  egressGateway:
+    url: ""
+    destination: ""
+    tokenSecretKey: egress-token
+
 secrets:
   # Pre-create this Secret. The chart never stores secret material in values.
   existingSecret: asv-secrets

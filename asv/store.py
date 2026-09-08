@@ -98,6 +98,21 @@ CREATE TABLE IF NOT EXISTS report (
   payload TEXT NOT NULL,
   signature TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS drill (
+  drill_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  approved_by TEXT NULL,
+  approved_at TEXT NULL,
+  rejected_by TEXT NULL,
+  rejected_at TEXT NULL,
+  rejection_reason TEXT NULL,
+  status TEXT NOT NULL,
+  request_payload TEXT NOT NULL,
+  run_id TEXT NULL
+);
 """
 
 

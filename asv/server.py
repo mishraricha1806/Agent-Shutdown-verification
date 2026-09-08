@@ -29,6 +29,9 @@ EVIDENCE_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/evidence$")
 EVENTS_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/events$")
 REPORT_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/report$")
 RESTART_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/restart$")
+DRILL_PATH = re.compile(r"^/v1/drills/([0-9a-f-]+)$")
+DRILL_APPROVE_PATH = re.compile(r"^/v1/drills/([0-9a-f-]+)/approve$")
+DRILL_REJECT_PATH = re.compile(r"^/v1/drills/([0-9a-f-]+)/reject$")
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -50,8 +53,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/v1/drills":
                 self.authenticator.require_role(principal, "drill_author")
-                result = self.control_plane.start_synthetic_drill(body, actor=principal.actor)
+                result = self.control_plane.request_drill(body, actor=principal.actor)
+                self._send(HTTPStatus.CREATED, result)
+                return
+            match = DRILL_APPROVE_PATH.fullmatch(urlparse(self.path).path)
+            if match:
+                self.authenticator.require_role(principal, "approver")
+                result = self.control_plane.approve_drill(
+                    principal.tenant_id, match.group(1), principal.actor
+                )
                 self._send(HTTPStatus.ACCEPTED, result)
+                return
+            match = DRILL_REJECT_PATH.fullmatch(urlparse(self.path).path)
+            if match:
+                self.authenticator.require_role(principal, "approver")
+                result = self.control_plane.reject_drill(
+                    principal.tenant_id, match.group(1), principal.actor,
+                    str(body.get("reason", "")),
+                )
+                self._send(HTTPStatus.OK, result)
                 return
             match = SHUTDOWN_PATH.fullmatch(urlparse(self.path).path)
             if match:
@@ -82,7 +102,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, {"status": "ok"})
                 return
             principal = self._principal()
-            self.authenticator.require_role(principal, "drill_author", "responder", "auditor")
+            self.authenticator.require_role(principal, "drill_author", "approver", "responder", "auditor")
+            match = DRILL_PATH.fullmatch(parsed.path)
+            if match:
+                self._send(HTTPStatus.OK, self.control_plane.get_drill(principal.tenant_id, match.group(1)))
+                return
             match = RUN_PATH.fullmatch(parsed.path)
             if match:
                 self._send(HTTPStatus.OK, self.control_plane.get_run(principal.tenant_id, match.group(1)))

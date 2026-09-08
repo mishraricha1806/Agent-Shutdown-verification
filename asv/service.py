@@ -45,6 +45,7 @@ class ControlPlane:
         self.deadline_seconds = deadline_seconds
         self._shutdown_lock = threading.RLock()
         self._report_lock = threading.RLock()
+        self._drill_lock = threading.RLock()
 
     def register_agent(self, request: dict[str, Any]) -> dict[str, Any]:
         required = ("tenant_id", "name", "image_digest", "namespace", "scope_owner")
@@ -103,7 +104,7 @@ class ControlPlane:
                 if parent["agent_id"] != agent_id:
                     raise ValidationError("parent run belongs to a different agent")
             run = {
-                "run_id": str(uuid.uuid4()),
+                "run_id": str(request.get("_run_id") or uuid.uuid4()),
                 "tenant_id": tenant_id,
                 "agent_id": agent_id,
                 "parent_run_id": parent_run_id,
@@ -402,15 +403,7 @@ class ControlPlane:
         actor: str,
         asynchronous: bool = True,
     ) -> dict[str, Any]:
-        tenant_id = str(request.get("tenant_id", ""))
-        agent_id = str(request.get("agent_id", ""))
-        if not tenant_id or not agent_id:
-            raise ValidationError("tenant_id and agent_id are required")
-        agent = self.get_agent(tenant_id, agent_id)
-        if not agent["namespace"].startswith("asv-"):
-            raise ValidationError("synthetic drills require an asv-* namespace")
-        if agent["declared_scope"].get("synthetic_only") is not True:
-            raise ValidationError("agent scope must explicitly set synthetic_only=true")
+        tenant_id, agent_id = self._validate_drill_request(request)
         raw_outcomes = request.get("outcomes")
         drill_adapter = self.adapter
         simulated = raw_outcomes is not None
@@ -428,13 +421,14 @@ class ControlPlane:
             except ValueError as error:
                 raise ValidationError("probe outcomes must be PASS, FAIL, PARTIAL, or UNKNOWN") from error
             drill_adapter = SyntheticAdapter(outcomes)
-        drill_id = str(uuid.uuid4())
+        drill_id = str(request.get("_drill_id") or uuid.uuid4())
         run = self.create_run(
             {
                 "tenant_id": tenant_id,
                 "agent_id": agent_id,
                 "identity_ref": f"synthetic/drill/{drill_id}",
                 "policy_version": int(request.get("policy_version", 1)),
+                "_run_id": request.get("_run_id"),
             }
         )
         receipt = self.request_shutdown(
@@ -446,6 +440,128 @@ class ControlPlane:
             adapter=drill_adapter,
         )
         return {"drill_id": drill_id, "synthetic_target": True, "simulated": simulated, **receipt}
+
+    def _validate_drill_request(self, request: dict[str, Any]) -> tuple[str, str]:
+        tenant_id = str(request.get("tenant_id", ""))
+        agent_id = str(request.get("agent_id", ""))
+        if not tenant_id or not agent_id:
+            raise ValidationError("tenant_id and agent_id are required")
+        agent = self.get_agent(tenant_id, agent_id)
+        if not agent["namespace"].startswith("asv-"):
+            raise ValidationError("synthetic drills require an asv-* namespace")
+        if agent["declared_scope"].get("synthetic_only") is not True:
+            raise ValidationError("agent scope must explicitly set synthetic_only=true")
+        raw_outcomes = request.get("outcomes")
+        if raw_outcomes is not None:
+            if not isinstance(raw_outcomes, dict) or set(raw_outcomes) != set(PROBE_KINDS):
+                raise ValidationError(
+                    "simulated outcomes must contain exactly: " + ", ".join(PROBE_KINDS)
+                )
+            try:
+                for result in raw_outcomes.values():
+                    ProbeResult(str(result))
+            except ValueError as error:
+                raise ValidationError("probe outcomes must be PASS, FAIL, PARTIAL, or UNKNOWN") from error
+        return tenant_id, agent_id
+
+    def request_drill(self, request: dict[str, Any], actor: str) -> dict[str, Any]:
+        tenant_id, agent_id = self._validate_drill_request(request)
+        drill_id = str(uuid.uuid4())
+        planned_run_id = str(uuid.uuid4())
+        requested_at = utc_now()
+        payload = {
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "policy_version": int(request.get("policy_version", 1)),
+        }
+        if "outcomes" in request:
+            payload["outcomes"] = request["outcomes"]
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT INTO drill VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    drill_id, tenant_id, agent_id, actor, requested_at,
+                    None, None, None, None, None, "PENDING_APPROVAL",
+                    canonical_json(payload), planned_run_id,
+                ),
+            )
+        return {
+            "drill_id": drill_id,
+            "status": "PENDING_APPROVAL",
+            "requested_by": actor,
+            "requested_at": requested_at,
+            "run_id": planned_run_id,
+        }
+
+    def get_drill(self, tenant_id: str, drill_id: str) -> dict[str, Any]:
+        with self.store.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM drill WHERE tenant_id=? AND drill_id=?", (tenant_id, drill_id)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("drill not found for tenant")
+        drill = dict(row)
+        drill["request_payload"] = json.loads(drill["request_payload"])
+        if drill["run_id"] and drill["status"] == "STARTED":
+            drill["run_state"] = self.get_run(tenant_id, drill["run_id"])["state"]
+        return drill
+
+    def approve_drill(
+        self, tenant_id: str, drill_id: str, actor: str, *, asynchronous: bool = True
+    ) -> dict[str, Any]:
+        with self._drill_lock:
+            drill = self.get_drill(tenant_id, drill_id)
+            if drill["status"] != "PENDING_APPROVAL":
+                if drill["status"] == "STARTED" and drill["approved_by"] == actor:
+                    return drill
+                raise ConflictError(f"drill cannot be approved from status {drill['status']}")
+            if drill["requested_by"] == actor:
+                raise ConflictError("drill approver must differ from drill author")
+            approved_at = utc_now()
+            with self.store.connection() as connection:
+                connection.execute(
+                    "UPDATE drill SET status='APPROVED',approved_by=?,approved_at=? WHERE tenant_id=? AND drill_id=?",
+                    (actor, approved_at, tenant_id, drill_id),
+                )
+            request = {
+                **drill["request_payload"],
+                "_drill_id": drill_id,
+                "_run_id": drill["run_id"],
+            }
+            try:
+                execution = self.start_synthetic_drill(
+                    request, actor=actor, asynchronous=asynchronous
+                )
+            except Exception:
+                with self.store.connection() as connection:
+                    connection.execute(
+                        "UPDATE drill SET status='FAILED' WHERE tenant_id=? AND drill_id=?",
+                        (tenant_id, drill_id),
+                    )
+                raise
+            with self.store.connection() as connection:
+                connection.execute(
+                    "UPDATE drill SET status='STARTED',run_id=? WHERE tenant_id=? AND drill_id=?",
+                    (execution["run_id"], tenant_id, drill_id),
+                )
+            return {**execution, "approved_by": actor, "approved_at": approved_at}
+
+    def reject_drill(self, tenant_id: str, drill_id: str, actor: str, reason: str) -> dict[str, Any]:
+        if not reason.strip():
+            raise ValidationError("rejection reason is required")
+        with self._drill_lock:
+            drill = self.get_drill(tenant_id, drill_id)
+            if drill["status"] != "PENDING_APPROVAL":
+                raise ConflictError(f"drill cannot be rejected from status {drill['status']}")
+            if drill["requested_by"] == actor:
+                raise ConflictError("drill reviewer must differ from drill author")
+            rejected_at = utc_now()
+            with self.store.connection() as connection:
+                connection.execute(
+                    "UPDATE drill SET status='REJECTED',rejected_by=?,rejected_at=?,rejection_reason=? WHERE tenant_id=? AND drill_id=?",
+                    (actor, rejected_at, reason.strip(), tenant_id, drill_id),
+                )
+        return self.get_drill(tenant_id, drill_id)
 
     @staticmethod
     def _shutdown_receipt(run: dict[str, Any]) -> dict[str, Any]:

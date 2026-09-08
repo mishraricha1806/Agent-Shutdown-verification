@@ -1,0 +1,1 @@
+"""Synthetic adversarial drill fixtures."""

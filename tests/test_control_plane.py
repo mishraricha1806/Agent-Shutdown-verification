@@ -3,7 +3,7 @@ import unittest
 from asv.adapters import SyntheticAdapter
 from asv.auth import AuthenticationError, AuthorizationError, Principal, TokenAuthenticator
 from asv.domain import PROBE_KINDS, ProbeResult, ShutdownState, aggregate_probe_results
-from asv.service import ConflictError, ControlPlane, ValidationError
+from asv.service import ConflictError, ControlPlane, NotFoundError, ValidationError
 from asv.store import Store
 
 
@@ -242,6 +242,43 @@ class ControlPlaneTest(unittest.TestCase):
                 actor="drill-author",
                 asynchronous=False,
             )
+
+    def test_drill_requires_independent_approval_before_execution(self):
+        agent = self.agent()
+        requested = self.control.request_drill(
+            {"tenant_id": "tenant-a", "agent_id": agent["agent_id"]},
+            actor="author@example.com",
+        )
+        self.assertEqual("PENDING_APPROVAL", requested["status"])
+        pending = self.control.get_drill("tenant-a", requested["drill_id"])
+        self.assertEqual(requested["run_id"], pending["run_id"])
+        with self.assertRaises(NotFoundError):
+            self.control.get_run("tenant-a", pending["run_id"])
+        with self.assertRaises(ConflictError):
+            self.control.approve_drill(
+                "tenant-a", requested["drill_id"], "author@example.com", asynchronous=False
+            )
+        approved = self.control.approve_drill(
+            "tenant-a", requested["drill_id"], "approver@example.com", asynchronous=False
+        )
+        self.assertEqual(requested["drill_id"], approved["drill_id"])
+        stored = self.control.get_drill("tenant-a", requested["drill_id"])
+        self.assertEqual("STARTED", stored["status"])
+        self.assertEqual("VERIFIED", stored["run_state"])
+
+    def test_independent_approver_can_reject_with_reason(self):
+        agent = self.agent()
+        requested = self.control.request_drill(
+            {"tenant_id": "tenant-a", "agent_id": agent["agent_id"]},
+            actor="author@example.com",
+        )
+        rejected = self.control.reject_drill(
+            "tenant-a", requested["drill_id"], "approver@example.com", "window not approved"
+        )
+        self.assertEqual("REJECTED", rejected["status"])
+        self.assertEqual("window not approved", rejected["rejection_reason"])
+        with self.assertRaises(NotFoundError):
+            self.control.get_run("tenant-a", rejected["run_id"])
 
 
 class AuthenticationTest(unittest.TestCase):

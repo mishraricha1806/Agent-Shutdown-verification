@@ -1,0 +1,107 @@
+{{- if .Values.adversarialFixture.enabled }}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" .Values.adversarialFixture.runId) }}
+{{- fail "adversarialFixture.runId must be a lowercase UUID" }}
+{{- end }}
+{{- if not (has .Values.adversarialFixture.namespace .Values.adapter.allowedNamespaces) }}
+{{- fail "adversarialFixture.namespace must be present in adapter.allowedNamespaces" }}
+{{- end }}
+{{- $fixtureName := printf "%s-fixture-%s" (include "asv.fullname" .) (trunc 8 .Values.adversarialFixture.runId) | trunc 63 | trimSuffix "-" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fixtureName }}
+  namespace: {{ .Values.adversarialFixture.namespace }}
+  labels:
+    {{- include "asv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: adversarial-fixture
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fixtureName }}
+  namespace: {{ .Values.adversarialFixture.namespace }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fixtureName }}
+  namespace: {{ .Values.adversarialFixture.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fixtureName }}
+    namespace: {{ .Values.adversarialFixture.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fixtureName }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fixtureName }}
+  namespace: {{ .Values.adversarialFixture.namespace }}
+  labels:
+    {{- include "asv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: adversarial-fixture
+    asv.openai.com/run-id: {{ .Values.adversarialFixture.runId | quote }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.adversarialFixture.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "asv.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: adversarial-fixture
+        asv.openai.com/run-id: {{ .Values.adversarialFixture.runId | quote }}
+    spec:
+      serviceAccountName: {{ $fixtureName }}
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: adversarial-agent
+          image: "{{ .Values.adversarialFixture.image.repository }}:{{ .Values.adversarialFixture.image.tag }}"
+          imagePullPolicy: {{ .Values.adversarialFixture.image.pullPolicy }}
+          env:
+            - {name: ASV_RUN_ID, value: {{ .Values.adversarialFixture.runId | quote }}}
+            - {name: ASV_FIXTURE_NAMESPACE, value: {{ .Values.adversarialFixture.namespace | quote }}}
+            - {name: ASV_FIXTURE_IMAGE, value: "{{ .Values.adversarialFixture.image.repository }}:{{ .Values.adversarialFixture.image.tag }}"}
+            - {name: ASV_FIXTURE_IDENTITY_REF, value: {{ .Values.adversarialFixture.identityRef | quote }}}
+            {{- if .Values.adversarialFixture.kafkaRest.url }}
+            - {name: ASV_FIXTURE_KAFKA_REST_URL, value: {{ .Values.adversarialFixture.kafkaRest.url | quote }}}
+            - {name: ASV_FIXTURE_KAFKA_TOPIC, value: {{ .Values.adversarialFixture.kafkaRest.topic | quote }}}
+            - name: ASV_FIXTURE_KAFKA_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Values.adversarialFixture.existingSecret }}, key: {{ .Values.adversarialFixture.kafkaRest.tokenSecretKey }}}}
+            {{- end }}
+            {{- if .Values.adversarialFixture.credentialBroker.url }}
+            - {name: ASV_FIXTURE_CREDENTIAL_BROKER_URL, value: {{ .Values.adversarialFixture.credentialBroker.url | quote }}}
+            - {name: ASV_FIXTURE_CREDENTIAL_RESOURCE, value: {{ .Values.adversarialFixture.credentialBroker.resource | quote }}}
+            - name: ASV_FIXTURE_CREDENTIAL_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Values.adversarialFixture.existingSecret }}, key: {{ .Values.adversarialFixture.credentialBroker.tokenSecretKey }}}}
+            {{- end }}
+            {{- if .Values.adversarialFixture.egressGateway.url }}
+            - {name: ASV_FIXTURE_EGRESS_GATEWAY_URL, value: {{ .Values.adversarialFixture.egressGateway.url | quote }}}
+            - {name: ASV_FIXTURE_EGRESS_DESTINATION, value: {{ required "adversarialFixture.egressGateway.destination is required" .Values.adversarialFixture.egressGateway.destination | quote }}}
+            - name: ASV_FIXTURE_EGRESS_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Values.adversarialFixture.existingSecret }}, key: {{ .Values.adversarialFixture.egressGateway.tokenSecretKey }}}}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+{{- end }}

@@ -52,6 +52,8 @@ reported as `UNKNOWN` rather than being treated as successful containment.
 - Persists lifecycle events to a transactional outbox and retries SIEM delivery.
 - Verifies authorized restart policy continuity and old-identity revocation.
 - Enforces signed, expiring service tokens and operator roles.
+- Requires a different authenticated approver before a requested drill can start.
+- Provides an opt-in adversarial fixture for the full pilot scenario.
 - Ships as a non-root container and Helm chart with opt-in Kubernetes RBAC.
 
 All external integrations are opt-in. Any adapter that is not configured or
@@ -108,6 +110,8 @@ See [the threat model](docs/threat-model.md) for abuse cases and unresolved risk
 | Signed JSON report | Implemented and cached per terminal run |
 | Durable SIEM delivery | Transactional outbox with at-least-once HTTP delivery |
 | Authorized restart probe | Implemented through the restart gateway contract |
+| Separation-of-duty drill approval | Implemented and persisted |
+| Adversarial pilot fixture | Implemented; disabled by default |
 | Helm packaging and restricted RBAC | Implemented |
 | High availability and restart recovery | Not implemented |
 
@@ -171,10 +175,14 @@ Build with the version in the Helm chart, scan the result, and publish it to an
 approved registry:
 
 ```bash
-export ASV_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification:0.5.0'
+export ASV_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification:0.6.0'
 docker build --pull --tag "$ASV_IMAGE" .
 docker image inspect "$ASV_IMAGE"
 docker push "$ASV_IMAGE"
+
+export ASV_FIXTURE_IMAGE='ghcr.io/YOUR_ORG/agent-shutdown-verification-fixture:0.6.0'
+docker build --pull --tag "$ASV_FIXTURE_IMAGE" fixtures
+docker push "$ASV_FIXTURE_IMAGE"
 ```
 
 Before promotion, pin the deployment to an immutable registry tag, capture the
@@ -230,7 +238,7 @@ helm lint deploy/helm/agent-shutdown-verification
 helm upgrade --install asv deploy/helm/agent-shutdown-verification \
   --namespace asv-system \
   --set image.repository=ghcr.io/YOUR_ORG/agent-shutdown-verification \
-  --set image.tag=0.5.0 \
+  --set image.tag=0.6.0 \
   --set persistence.enabled=true \
   --wait \
   --timeout 5m
@@ -273,7 +281,7 @@ kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}'
 Copy and review the provided configuration:
 
 ```bash
-cp deploy/helm/agent-shutdown-verification/examples/values-week5.yaml values-lab.yaml
+cp deploy/helm/agent-shutdown-verification/examples/values-week6.yaml values-lab.yaml
 ```
 
 At minimum, replace:
@@ -307,6 +315,8 @@ Credential and network contracts are specified in the
 [credential broker and egress gateway guide](docs/credential-egress-adapters.md).
 Report, outbox delivery, and restart semantics are specified in the
 [Week 5 operations guide](docs/report-siem-restart.md).
+The complete adversarial exercise and acceptance criteria are in the
+[pilot runbook](docs/pilot-runbook.md).
 
 ## Operate a drill
 
@@ -324,10 +334,22 @@ shared HMAC authentication model remains in use:
 
 ```bash
 export ASV_AUTH_SECRET='value-retrieved-through-approved-secret-workflow'
-export TOKEN="$(python3 -m asv.auth \
+export AUTHOR_TOKEN="$(python3 -m asv.auth \
+  --tenant pilot-tenant \
+  --actor author@example.com \
+  --roles drill_author \
+  --ttl 900)"
+
+export APPROVER_TOKEN="$(python3 -m asv.auth \
+  --tenant pilot-tenant \
+  --actor approver@example.com \
+  --roles approver \
+  --ttl 900)"
+
+export RESPONDER_TOKEN="$(python3 -m asv.auth \
   --tenant pilot-tenant \
   --actor responder@example.com \
-  --roles drill_author,responder,auditor \
+  --roles responder,auditor \
   --ttl 900)"
 ```
 
@@ -339,7 +361,7 @@ scope. The namespace must be allowlisted before a real drill can act on it:
 ```bash
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/agents \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $AUTHOR_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{
     "name": "shutdown-drill-agent",
@@ -355,20 +377,30 @@ curl --fail --silent --show-error \
 
 Record the returned `agent_id`.
 
-### 3. Start a real adapter drill
+### 3. Request and approve a real adapter drill
 
-Omitting `outcomes` uses the configured adapter. The request returns `202`
-immediately and never claims synchronous verification:
+Omitting `outcomes` uses the configured adapter. The author request creates a
+pending approval and reserves the run ID without starting shutdown:
 
 ```bash
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/drills \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $AUTHOR_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"agent_id":"AGENT_UUID"}'
 ```
 
-Record the returned `run_id` and `correlation_id`.
+Record the returned `drill_id` and reserved `run_id`. Configure the adversarial
+fixture with that run ID and verify it is ready before approval. A different
+actor with the `approver` role then starts the drill:
+
+```bash
+curl --fail --silent --show-error \
+  -X POST http://127.0.0.1:8080/v1/drills/DRILL_UUID/approve \
+  -H "Authorization: Bearer $APPROVER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{}'
+```
 
 To exercise reporting without external infrastructure, provide all five
 explicit simulated outcomes. Simulated and real results are distinguished in
@@ -377,7 +409,7 @@ the response:
 ```bash
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/drills \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $AUTHOR_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{
     "agent_id": "AGENT_UUID",
@@ -391,30 +423,32 @@ curl --fail --silent --show-error \
   }'
 ```
 
+The simulation request is also pending until independently approved.
+
 ### 4. Read the result
 
 ```bash
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/runs/RUN_UUID \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $RESPONDER_TOKEN"
 
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/runs/RUN_UUID/evidence \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $RESPONDER_TOKEN"
 
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/runs/RUN_UUID/events \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $RESPONDER_TOKEN"
 
 curl --fail --silent --show-error \
   -X POST http://127.0.0.1:8080/v1/runs/RUN_UUID/restart \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $RESPONDER_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{}'
 
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/runs/RUN_UUID/report \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $RESPONDER_TOKEN"
 ```
 
 Interpret terminal states conservatively:
@@ -432,7 +466,10 @@ Interpret terminal states conservatively:
 |---|---|---|
 | `POST /v1/agents` | `drill_author` | Register an agent deployment |
 | `POST /v1/runs` | `drill_author` | Register an agent run or child run |
-| `POST /v1/drills` | `drill_author` | Create a run and request its shutdown |
+| `POST /v1/drills` | `drill_author` | Request a drill and reserve its run ID |
+| `GET /v1/drills/{drillId}` | Any operator role | Read approval and execution state |
+| `POST /v1/drills/{drillId}/approve` | `approver` | Approve and start a pending drill |
+| `POST /v1/drills/{drillId}/reject` | `approver` | Reject a pending drill with a reason |
 | `POST /v1/runs/{runId}/shutdown` | `responder` | Request an idempotent external shutdown |
 | `GET /v1/runs/{runId}` | Any operator role | Read state, probes, and delegated jobs |
 | `GET /v1/runs/{runId}/evidence` | Any operator role | Read evidence records and signed manifest |
@@ -444,6 +481,7 @@ Interpret terminal states conservatively:
 The supported roles are:
 
 - `drill_author`: registers agents and creates runs or drills.
+- `approver`: independently approves or rejects requested drills.
 - `responder`: requests shutdown.
 - `auditor`: reads results, evidence, and exported events.
 
@@ -452,7 +490,7 @@ For a direct shutdown request, always provide a stable idempotency key:
 ```bash
 curl --fail --silent --show-error \
   http://127.0.0.1:8080/v1/runs/RUN_UUID/shutdown \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $RESPONDER_TOKEN" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: incident-2026-09-06-run-001' \
   --data '{}'
@@ -585,8 +623,8 @@ drill:
 - Add metrics for fencing, termination, credential rejection, network denial,
   remaining jobs/actions, unknown probes, and evidence-integrity failures.
 - Add admission policies that reject privileged workloads and host-path mounts.
-- Add separation-of-duty approval for drill authors, approvers, responders, and
-  auditors.
+- Integrate separation-of-duty approval with an external identity provider and
+  enterprise change-management records.
 - Add external security review, threat-model validation, load testing, disaster
   recovery exercises, supply-chain controls, and signed release artifacts.
 - Demonstrate the full adversarial drill in a disposable pilot environment.
@@ -599,6 +637,7 @@ Until these gates are closed, use ASV only in controlled synthetic environments.
 asv/                         Control API, state machine, evidence, and adapters
 deploy/helm/                 Helm chart and lab configuration
 docs/                        Threat model and integration contracts
+fixtures/                    Opt-in adversarial pilot workload
 tests/                       Acceptance and integration tests
 Dockerfile                   Non-root controller image
 ```

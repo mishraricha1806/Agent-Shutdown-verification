@@ -25,6 +25,9 @@
 {{- if and (or .Values.adapter.restartGateway.enabled .Values.siem.enabled) (empty .Values.networkPolicy.extraEgress) }}
 {{- fail "networkPolicy.extraEgress must explicitly allow configured Week 5 endpoints" }}
 {{- end }}
+{{- if eq .Values.image.tag "latest" }}
+{{- fail "image.tag must be immutable and cannot be latest" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,6 +36,9 @@ metadata:
     {{- include "asv.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 300
+  minReadySeconds: 5
   strategy:
     type: Recreate
   selector:
@@ -52,6 +58,10 @@ spec:
     spec:
       serviceAccountName: {{ include "asv.controllerServiceAccountName" . }}
       automountServiceAccountToken: {{ .Values.rbac.kubernetesAdapter.enabled }}
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
       terminationGracePeriodSeconds: {{ .Values.controller.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -156,6 +166,13 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 15
           livenessProbe:
             httpGet:
               path: /healthz
