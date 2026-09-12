@@ -113,6 +113,16 @@ CREATE TABLE IF NOT EXISTS drill (
   request_payload TEXT NOT NULL,
   run_id TEXT NULL
 );
+CREATE TABLE IF NOT EXISTS shutdown_work (
+  run_id TEXT PRIMARY KEY REFERENCES run(run_id),
+  tenant_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  lease_owner TEXT NULL,
+  lease_expires_at TEXT NULL,
+  last_error TEXT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 

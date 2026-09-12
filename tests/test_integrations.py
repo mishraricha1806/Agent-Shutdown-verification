@@ -96,6 +96,15 @@ class KubernetesAdapterTest(unittest.TestCase):
         self.assertIn({RUN_LABEL: RUN["run_id"]}, selectors)
         self.assertIn({PARENT_RUN_LABEL: RUN["run_id"]}, selectors)
 
+    def test_kubernetes_delete_is_replay_safe_after_recovery(self):
+        def transport(method, url, headers, body):
+            return HttpResult(404, {"reason": "NotFound"})
+
+        client = KubernetesClient(
+            "https://kubernetes.example.test", "token", transport=transport
+        )
+        client.delete("asv-synthetic", "pods", "already-deleted")
+
     def test_fences_and_recursively_stops_parent_and_child_work(self):
         kubernetes = FakeKubernetes()
         adapter = KubernetesKafkaAdapter(kubernetes, {"asv-synthetic"})

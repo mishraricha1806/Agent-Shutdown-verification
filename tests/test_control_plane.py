@@ -1,4 +1,5 @@
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from asv.adapters import SyntheticAdapter
 from asv.auth import AuthenticationError, AuthorizationError, Principal, TokenAuthenticator
@@ -91,6 +92,75 @@ class ControlPlaneTest(unittest.TestCase):
             self.control.request_shutdown(
                 "tenant-a", run["run_id"], actor="operator", idempotency_key="stop-2", asynchronous=False
             )
+
+    def test_recovery_resumes_from_last_committed_phase(self):
+        class RecordingAdapter(SyntheticAdapter):
+            def __init__(self):
+                super().__init__({kind: ProbeResult.PASS for kind in PROBE_KINDS})
+                self.calls = []
+
+            def fence(self, run):
+                self.calls.append("fence")
+                return super().fence(run)
+
+            def stop_process(self, run):
+                self.calls.append("stop")
+                return super().stop_process(run)
+
+            def discover_children(self, run):
+                self.calls.append("discover")
+                return super().discover_children(run)
+
+            def probe(self, kind, run):
+                self.calls.append(kind)
+                return super().probe(kind, run)
+
+        run = self.make_run()
+        future = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE run SET state='PROCESS_STOP_SENT',shutdown_requested_at=?,"
+                "deadline_at=?,shutdown_idempotency_key='recovery-test' WHERE run_id=?",
+                (datetime.now(UTC).isoformat(), future, run["run_id"]),
+            )
+        adapter = RecordingAdapter()
+        recovered = ControlPlane(
+            self.store, signing_key=b"test-key", adapter=adapter,
+            recovery_lease_seconds=1,
+        )
+        result = recovered.recover_incomplete_shutdowns(asynchronous=False)
+        finished = recovered.get_run("tenant-a", run["run_id"])
+
+        self.assertEqual({"resumed": 1, "expired": 0, "busy": 0}, result)
+        self.assertEqual(ShutdownState.VERIFIED, finished["state"])
+        self.assertEqual(
+            ["discover", "process", "delegation", "kafka", "credential", "network"],
+            adapter.calls,
+        )
+        events = recovered.export_events("tenant-a", run["run_id"])["events"]
+        self.assertEqual(1, sum(e["event_type"] == "shutdown.recovery.resumed" for e in events))
+
+    def test_recovery_never_verifies_an_expired_shutdown(self):
+        run = self.make_run()
+        past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE run SET state='FENCING',shutdown_requested_at=?,deadline_at=?,"
+                "shutdown_idempotency_key='expired-test' WHERE run_id=?",
+                (past, past, run["run_id"]),
+            )
+        recovered = ControlPlane(self.store, signing_key=b"test-key", adapter=self.adapter)
+        result = recovered.recover_incomplete_shutdowns(asynchronous=False)
+        finished = recovered.get_run("tenant-a", run["run_id"])
+
+        self.assertEqual({"resumed": 0, "expired": 1, "busy": 0}, result)
+        self.assertEqual(ShutdownState.UNKNOWN, finished["state"])
+        self.assertEqual([], finished["probes"])
+        events = recovered.export_events("tenant-a", run["run_id"])["events"]
+        self.assertEqual(
+            1,
+            sum(e["event_type"] == "shutdown.recovery.deadline.exceeded" for e in events),
+        )
 
     def test_unknown_is_never_promoted_to_verified(self):
         self.assertEqual(
@@ -279,6 +349,30 @@ class ControlPlaneTest(unittest.TestCase):
         self.assertEqual("window not approved", rejected["rejection_reason"])
         with self.assertRaises(NotFoundError):
             self.control.get_run("tenant-a", rejected["run_id"])
+
+    def test_recovery_starts_a_drill_stranded_after_approval(self):
+        agent = self.agent()
+        requested = self.control.request_drill(
+            {
+                "tenant_id": "tenant-a",
+                "agent_id": agent["agent_id"],
+                "outcomes": {kind: "PASS" for kind in PROBE_KINDS},
+            },
+            actor="author@example.com",
+        )
+        approved_at = datetime.now(UTC).isoformat()
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE drill SET status='APPROVED',approved_by=?,approved_at=? "
+                "WHERE drill_id=?",
+                ("approver@example.com", approved_at, requested["drill_id"]),
+            )
+
+        recovered = ControlPlane(self.store, signing_key=b"test-key")
+        self.assertEqual(1, recovered.recover_approved_drills(asynchronous=False))
+        drill = recovered.get_drill("tenant-a", requested["drill_id"])
+        self.assertEqual("STARTED", drill["status"])
+        self.assertEqual("VERIFIED", drill["run_state"])
 
 
 class AuthenticationTest(unittest.TestCase):

@@ -16,6 +16,7 @@
       "type": "object",
       "properties": {
         "deadlineSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "recoveryIntervalSeconds": {"type": "number", "minimum": 0.25, "maximum": 3600},
         "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1}
       }
     },

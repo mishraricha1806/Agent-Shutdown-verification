@@ -37,6 +37,10 @@ reported as `UNKNOWN` rather than being treated as successful containment.
   scope, owner, namespace, and tenant.
 - Tracks parent and child runs with correlation and policy versions.
 - Accepts idempotent, asynchronous shutdown requests.
+- Resumes incomplete shutdowns after controller restart using persisted phases
+  and a single-worker lease; expired operations terminate as `UNKNOWN`.
+- Reconciles independently approved drills if the controller stops between
+  approval, reserved-run creation, and shutdown dispatch.
 - Fences work before sending process termination.
 - Discovers and persists delegated Kubernetes Jobs and CronJobs.
 - Recursively stops labeled Pods and Jobs and suspends CronJobs.
@@ -113,7 +117,8 @@ See [the threat model](docs/threat-model.md) for abuse cases and unresolved risk
 | Separation-of-duty drill approval | Implemented and persisted |
 | Adversarial pilot fixture | Implemented; disabled by default |
 | Helm packaging and restricted RBAC | Implemented |
-| High availability and restart recovery | Not implemented |
+| Restart recovery | Implemented for the single-replica SQLite deployment |
+| High availability | Not implemented |
 
 ## Prerequisites
 
@@ -558,9 +563,18 @@ or using SQLite’s online backup API. Copying the file during active writes is 
 a supported recovery procedure. Validate restoration and evidence-chain
 integrity in a separate namespace before returning the service to use.
 
-If the controller restarts during an active shutdown, inspect the run and treat
-the outcome as unresolved. Automatic orchestration resumption is not yet
-implemented; do not manually relabel such a run as `VERIFIED`.
+If the controller restarts during an active shutdown, its recovery worker claims
+the persisted work lease and resumes at the last committed phase. Already saved
+probe kinds are not repeated. A run whose deadline elapsed while the controller
+was unavailable becomes `UNKNOWN`; it is never promoted to `VERIFIED`. Inspect
+the `shutdown.recovery.resumed` and
+`shutdown.recovery.deadline.exceeded` evidence events after every recovery.
+
+Recovery currently targets the chart's enforced single-replica SQLite
+deployment. It is not a high-availability or multi-region orchestration claim.
+The same worker also reconciles a drill left in `APPROVED`: it creates the
+reserved run if necessary and dispatches its idempotent shutdown before moving
+the drill to `STARTED`.
 
 ### Uninstall
 
@@ -598,6 +612,7 @@ post-drill cleanup procedure after evidence has been exported.
 | `ASV_SIEM_URL` | Empty | Enables background outbox delivery |
 | `ASV_SIEM_BEARER_TOKEN` | Empty | SIEM ingestion token |
 | `ASV_SIEM_INTERVAL_SECONDS` | `5` | Pending-event polling interval |
+| `ASV_RECOVERY_INTERVAL_SECONDS` | `5` | Incomplete-shutdown recovery polling interval |
 
 The authoritative Helm defaults and validation constraints are in
 [values.yaml](deploy/helm/agent-shutdown-verification/values.yaml) and
@@ -609,7 +624,8 @@ The following must be completed before a production claim or production-target
 drill:
 
 - Replace SQLite with tenant-isolated PostgreSQL and managed schema migrations.
-- Add durable orchestration recovery, leasing, deadlines, and retry policies.
+- Replace the single-replica SQLite recovery lease with a horizontally safe
+  orchestration backend, fenced leases, and bounded retry policies.
 - Replace local service-token authentication with workload identity, mTLS, and
   an enterprise identity provider supporting revocation and key rotation.
 - Replace HMAC evidence signing with KMS-backed asymmetric signatures and

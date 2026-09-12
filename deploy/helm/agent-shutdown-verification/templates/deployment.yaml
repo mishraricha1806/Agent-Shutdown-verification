@@ -83,6 +83,8 @@ spec:
             - --deadline-seconds
             - {{ .Values.controller.deadlineSeconds | quote }}
           env:
+            - name: ASV_RECOVERY_INTERVAL_SECONDS
+              value: {{ .Values.controller.recoveryIntervalSeconds | quote }}
             - name: ASV_ADAPTER_MODE
               value: {{ .Values.adapter.mode | quote }}
             - name: ASV_ALLOWED_NAMESPACES

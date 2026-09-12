@@ -38,11 +38,14 @@ class ControlPlane:
         signing_key: bytes,
         adapter: ShutdownAdapter | None = None,
         deadline_seconds: int = 60,
+        recovery_lease_seconds: int = 30,
     ) -> None:
         self.store = store
         self.ledger = EvidenceLedger(store, signing_key)
         self.adapter = adapter or SafeUnknownAdapter()
         self.deadline_seconds = deadline_seconds
+        self.recovery_lease_seconds = recovery_lease_seconds
+        self._worker_id = str(uuid.uuid4())
         self._shutdown_lock = threading.RLock()
         self._report_lock = threading.RLock()
         self._drill_lock = threading.RLock()
@@ -188,6 +191,11 @@ class ControlPlane:
                 "UPDATE run SET state=?,shutdown_requested_at=?,deadline_at=?,shutdown_idempotency_key=? WHERE tenant_id=? AND run_id=?",
                 (ShutdownState.REQUESTED.value, requested_at, deadline_at, idempotency_key, tenant_id, run_id),
             )
+            connection.execute(
+                "INSERT INTO shutdown_work VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET status='PENDING',updated_at=excluded.updated_at",
+                (run_id, tenant_id, "PENDING", 0, None, None, None, requested_at),
+            )
             run.update(
                 state=ShutdownState.REQUESTED.value,
                 shutdown_requested_at=requested_at,
@@ -206,24 +214,62 @@ class ControlPlane:
         return self._shutdown_receipt(run)
 
     def _orchestrate(
-        self, tenant_id: str, run_id: str, actor: str, adapter: ShutdownAdapter
+        self, tenant_id: str, run_id: str, actor: str, adapter: ShutdownAdapter,
+        *, recovering: bool = False, lease_owner: str | None = None,
     ) -> None:
+        lease_owner = lease_owner or self._claim_shutdown_work(tenant_id, run_id)
+        if lease_owner is None:
+            return
         try:
             run = self._adapter_run(tenant_id, run_id)
-            self._transition(run, ShutdownState.FENCING, "shutdown.fenced", adapter.fence(run), actor)
-            run = self._adapter_run(tenant_id, run_id)
-            self._transition(run, ShutdownState.PROCESS_STOP_SENT, "shutdown.process.stop.sent", adapter.stop_process(run), actor)
-            run = self._adapter_run(tenant_id, run_id)
-            discovery = adapter.discover_children(run)
-            self._save_delegated_jobs(run, discovery.get("children", []))
-            self._transition(run, ShutdownState.CHILD_DISCOVERY, "agent.child.discovered", discovery, actor)
-            run = self._adapter_run(tenant_id, run_id)
-            self._transition(run, ShutdownState.PROBING, "shutdown.probe.requested", {"kinds": list(PROBE_KINDS)}, actor)
-            results: list[ProbeResult] = []
+            if recovering:
+                self._append_event(
+                    run, "shutdown.recovery.resumed",
+                    {"state": run["state"], "worker_id": self._worker_id},
+                    "recovery-worker",
+                )
+            if self._deadline_expired(run):
+                self._expire_shutdown(run, lease_owner)
+                return
+            state = ShutdownState(run["state"])
+            if state == ShutdownState.REQUESTED:
+                self._renew_shutdown_lease(run_id, lease_owner)
+                self._transition(run, ShutdownState.FENCING, "shutdown.fenced", adapter.fence(run), actor)
+                run = self._adapter_run(tenant_id, run_id)
+                state = ShutdownState.FENCING
+            if state == ShutdownState.FENCING:
+                self._renew_shutdown_lease(run_id, lease_owner)
+                self._transition(run, ShutdownState.PROCESS_STOP_SENT, "shutdown.process.stop.sent", adapter.stop_process(run), actor)
+                run = self._adapter_run(tenant_id, run_id)
+                state = ShutdownState.PROCESS_STOP_SENT
+            if state == ShutdownState.PROCESS_STOP_SENT:
+                self._renew_shutdown_lease(run_id, lease_owner)
+                discovery = adapter.discover_children(run)
+                self._save_delegated_jobs(run, discovery.get("children", []))
+                self._transition(run, ShutdownState.CHILD_DISCOVERY, "agent.child.discovered", discovery, actor)
+                run = self._adapter_run(tenant_id, run_id)
+                state = ShutdownState.CHILD_DISCOVERY
+            if state == ShutdownState.CHILD_DISCOVERY:
+                self._transition(run, ShutdownState.PROBING, "shutdown.probe.requested", {"kinds": list(PROBE_KINDS)}, actor)
+                run = self._adapter_run(tenant_id, run_id)
+                state = ShutdownState.PROBING
+            if state != ShutdownState.PROBING:
+                if state in TERMINAL_STATES:
+                    self._finish_shutdown_work(run_id, lease_owner)
+                    return
+                raise RuntimeError(f"cannot orchestrate shutdown from state {state.value}")
+            existing = {probe["kind"]: ProbeResult(probe["result"]) for probe in run["probes"]}
             for kind in PROBE_KINDS:
+                if kind in existing:
+                    continue
+                if self._deadline_expired(run):
+                    self._expire_shutdown(run, lease_owner)
+                    return
+                self._renew_shutdown_lease(run_id, lease_owner)
                 observation = adapter.probe(kind, run)
-                results.append(observation.result)
+                existing[kind] = observation.result
                 self._save_probe(run, observation)
+            results = [existing.get(kind, ProbeResult.UNKNOWN) for kind in PROBE_KINDS]
             terminal = aggregate_probe_results(results)
             run = self.get_run(tenant_id, run_id)
             self._transition(
@@ -231,7 +277,9 @@ class ControlPlane:
                 {"result": terminal.value, "probe_results": [result.value for result in results]}, actor,
                 stopped=True,
             )
+            self._finish_shutdown_work(run_id, lease_owner)
         except Exception as error:
+            self._fail_shutdown_work(run_id, lease_owner, error)
             try:
                 run = self.get_run(tenant_id, run_id)
                 self._transition(
@@ -241,6 +289,182 @@ class ControlPlane:
                 )
             except Exception:
                 pass
+
+    def recover_incomplete_shutdowns(self, *, asynchronous: bool = True) -> dict[str, int]:
+        """Resume persisted shutdowns whose lease is available.
+
+        Re-entry starts at the last committed state and skips probe kinds that
+        already have durable observations. Expired runs are terminal UNKNOWN.
+        """
+        with self.store.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM run WHERE shutdown_requested_at IS NOT NULL "
+                "AND state NOT IN ('VERIFIED','PARTIAL','UNKNOWN','FAILED') "
+                "ORDER BY shutdown_requested_at"
+            ).fetchall()
+        resumed = expired = busy = 0
+        for row in rows:
+            run = self.store.row(row)
+            assert run is not None
+            if self._deadline_expired(run):
+                lease_owner = self._claim_shutdown_work(run["tenant_id"], run["run_id"])
+                if lease_owner is not None:
+                    self._expire_shutdown(run, lease_owner)
+                    expired += 1
+                else:
+                    busy += 1
+                continue
+            lease_owner = self._claim_shutdown_work(run["tenant_id"], run["run_id"])
+            if lease_owner is None:
+                busy += 1
+                continue
+            adapter = self._recovery_adapter(run["tenant_id"], run["run_id"])
+            if asynchronous:
+                threading.Thread(
+                    target=self._orchestrate,
+                    args=(run["tenant_id"], run["run_id"], "recovery-worker", adapter),
+                    kwargs={"recovering": True, "lease_owner": lease_owner},
+                    daemon=True,
+                ).start()
+            else:
+                self._orchestrate(
+                    run["tenant_id"], run["run_id"], "recovery-worker", adapter,
+                    recovering=True, lease_owner=lease_owner,
+                )
+            resumed += 1
+        return {"resumed": resumed, "expired": expired, "busy": busy}
+
+    def start_recovery_worker(self, interval_seconds: float = 5.0) -> threading.Event:
+        if interval_seconds <= 0:
+            raise ValueError("recovery interval must be positive")
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.is_set():
+                try:
+                    self.recover_approved_drills()
+                    self.recover_incomplete_shutdowns()
+                except Exception as error:
+                    print(f"recovery worker error: {type(error).__name__}: {error}")
+                stop.wait(interval_seconds)
+
+        threading.Thread(target=run, name="asv-recovery", daemon=True).start()
+        return stop
+
+    def recover_approved_drills(self, *, asynchronous: bool = True) -> int:
+        """Start or reconcile drills interrupted after approval was committed."""
+        recovered = 0
+        with self._drill_lock:
+            with self.store.connection() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM drill WHERE status='APPROVED' ORDER BY approved_at"
+                ).fetchall()
+            for row in rows:
+                drill = dict(row)
+                request = json.loads(drill["request_payload"])
+                try:
+                    run = self.get_run(drill["tenant_id"], drill["run_id"])
+                except NotFoundError:
+                    execution = self.start_synthetic_drill(
+                        {
+                            **request,
+                            "_drill_id": drill["drill_id"],
+                            "_run_id": drill["run_id"],
+                        },
+                        actor=drill["approved_by"] or "recovery-worker",
+                        asynchronous=asynchronous,
+                    )
+                    run_id = execution["run_id"]
+                else:
+                    run_id = run["run_id"]
+                    if not run.get("shutdown_requested_at"):
+                        self.request_shutdown(
+                            drill["tenant_id"], run_id,
+                            actor=drill["approved_by"] or "recovery-worker",
+                            idempotency_key=f"drill:{drill['drill_id']}",
+                            asynchronous=asynchronous,
+                            adapter=self._recovery_adapter(drill["tenant_id"], run_id),
+                        )
+                with self.store.connection() as connection:
+                    connection.execute(
+                        "UPDATE drill SET status='STARTED',run_id=? "
+                        "WHERE tenant_id=? AND drill_id=? AND status='APPROVED'",
+                        (run_id, drill["tenant_id"], drill["drill_id"]),
+                    )
+                recovered += 1
+        return recovered
+
+    def _recovery_adapter(self, tenant_id: str, run_id: str) -> ShutdownAdapter:
+        with self.store.connection() as connection:
+            row = connection.execute(
+                "SELECT request_payload FROM drill WHERE tenant_id=? AND run_id=?",
+                (tenant_id, run_id),
+            ).fetchone()
+        if row is not None:
+            request = json.loads(row["request_payload"])
+            outcomes = request.get("outcomes")
+            if isinstance(outcomes, dict) and set(outcomes) == set(PROBE_KINDS):
+                return SyntheticAdapter(
+                    {kind: ProbeResult(str(outcomes[kind])) for kind in PROBE_KINDS}
+                )
+        return self.adapter
+
+    def _claim_shutdown_work(self, tenant_id: str, run_id: str) -> str | None:
+        now = utc_now()
+        lease_until = (datetime.now(UTC) + timedelta(seconds=self.recovery_lease_seconds)).isoformat()
+        lease_owner = f"{self._worker_id}:{uuid.uuid4()}"
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO shutdown_work VALUES (?,?,?,?,?,?,?,?)",
+                (run_id, tenant_id, "PENDING", 0, None, None, None, now),
+            )
+            cursor = connection.execute(
+                "UPDATE shutdown_work SET status='RUNNING',attempts=attempts+1,"
+                "lease_owner=?,lease_expires_at=?,last_error=NULL,updated_at=? "
+                "WHERE run_id=? AND status!='COMPLETE' AND "
+                "(lease_owner IS NULL OR lease_expires_at<=?)",
+                (lease_owner, lease_until, now, run_id, now),
+            )
+        return lease_owner if cursor.rowcount == 1 else None
+
+    def _renew_shutdown_lease(self, run_id: str, lease_owner: str) -> None:
+        lease_until = (datetime.now(UTC) + timedelta(seconds=self.recovery_lease_seconds)).isoformat()
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE shutdown_work SET lease_expires_at=?,updated_at=? "
+                "WHERE run_id=? AND lease_owner=?",
+                (lease_until, utc_now(), run_id, lease_owner),
+            )
+
+    def _finish_shutdown_work(self, run_id: str, lease_owner: str) -> None:
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE shutdown_work SET status='COMPLETE',lease_owner=NULL,"
+                "lease_expires_at=NULL,last_error=NULL,updated_at=? "
+                "WHERE run_id=? AND lease_owner=?",
+                (utc_now(), run_id, lease_owner),
+            )
+
+    def _fail_shutdown_work(self, run_id: str, lease_owner: str, error: Exception) -> None:
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE shutdown_work SET status='COMPLETE',lease_owner=NULL,"
+                "lease_expires_at=NULL,last_error=?,updated_at=? "
+                "WHERE run_id=? AND lease_owner=?",
+                (f"{type(error).__name__}: {error}", utc_now(), run_id, lease_owner),
+            )
+
+    @staticmethod
+    def _deadline_expired(run: dict[str, Any]) -> bool:
+        deadline = run.get("deadline_at")
+        return bool(deadline and datetime.fromisoformat(str(deadline)) <= datetime.now(UTC))
+
+    def _expire_shutdown(self, run: dict[str, Any], lease_owner: str) -> None:
+        self._transition(
+            run, ShutdownState.UNKNOWN, "shutdown.recovery.deadline.exceeded",
+            {"deadline_at": run.get("deadline_at")}, "recovery-worker", stopped=True,
+        )
+        self._finish_shutdown_work(run["run_id"], lease_owner)
 
     def _adapter_run(self, tenant_id: str, run_id: str) -> dict[str, Any]:
         run = self.get_run(tenant_id, run_id)

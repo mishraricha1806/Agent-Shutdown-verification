@@ -244,6 +244,9 @@ def build_server(
         server.outbox_thread = publisher.start(  # type: ignore[attr-defined]
             float(os.environ.get("ASV_SIEM_INTERVAL_SECONDS", "5"))
         )
+    server.recovery_stop = ApiHandler.control_plane.start_recovery_worker(  # type: ignore[attr-defined]
+        float(os.environ.get("ASV_RECOVERY_INTERVAL_SECONDS", "5"))
+    )
     return server
 
 
@@ -261,6 +264,9 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        recovery_stop = getattr(server, "recovery_stop", None)
+        if recovery_stop is not None:
+            recovery_stop.set()
         server.server_close()
 
 

@@ -112,11 +112,16 @@ class KubernetesClient:
 
     def delete(self, namespace: str, resource: str, name: str) -> None:
         group = "api/v1" if resource == "pods" else "apis/batch/v1"
-        self.request(
-            "DELETE",
-            f"/{group}/namespaces/{namespace}/{resource}/{urllib.parse.quote(name, safe='')}",
-            {"propagationPolicy": "Foreground", "gracePeriodSeconds": 0},
-        )
+        try:
+            self.request(
+                "DELETE",
+                f"/{group}/namespaces/{namespace}/{resource}/{urllib.parse.quote(name, safe='')}",
+                {"propagationPolicy": "Foreground", "gracePeriodSeconds": 0},
+            )
+        except IntegrationError as error:
+            # Recovery can replay a completed delete after a process crash.
+            if "returned 404" not in str(error):
+                raise
 
     def suspend_cronjob(self, namespace: str, name: str) -> None:
         self.request(
