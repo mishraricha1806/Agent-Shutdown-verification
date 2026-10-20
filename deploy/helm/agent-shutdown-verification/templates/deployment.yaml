@@ -25,6 +25,9 @@
 {{- if and (or .Values.adapter.restartGateway.enabled .Values.siem.enabled) (empty .Values.networkPolicy.extraEgress) }}
 {{- fail "networkPolicy.extraEgress must explicitly allow configured Week 5 endpoints" }}
 {{- end }}
+{{- if and .Values.siem.enabled (lt (float64 .Values.siem.maxBackoffSeconds) (float64 .Values.siem.baseBackoffSeconds)) }}
+{{- fail "siem.maxBackoffSeconds must be greater than or equal to siem.baseBackoffSeconds" }}
+{{- end }}
 {{- if eq .Values.image.tag "latest" }}
 {{- fail "image.tag must be immutable and cannot be latest" }}
 {{- end }}
@@ -150,6 +153,12 @@ spec:
               value: {{ required "siem.url is required when SIEM delivery is enabled" .Values.siem.url | quote }}
             - name: ASV_SIEM_INTERVAL_SECONDS
               value: {{ .Values.siem.intervalSeconds | quote }}
+            - name: ASV_SIEM_MAX_ATTEMPTS
+              value: {{ .Values.siem.maxAttempts | quote }}
+            - name: ASV_SIEM_BASE_BACKOFF_SECONDS
+              value: {{ .Values.siem.baseBackoffSeconds | quote }}
+            - name: ASV_SIEM_MAX_BACKOFF_SECONDS
+              value: {{ .Values.siem.maxBackoffSeconds | quote }}
             - name: ASV_SIEM_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:

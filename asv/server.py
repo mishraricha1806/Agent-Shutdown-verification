@@ -18,6 +18,7 @@ from .integrations import (
     KubernetesKafkaAdapter,
     RestartGatewayProbe,
 )
+from .metrics import MetricsExporter
 from .service import ConflictError, ControlPlane, NotFoundError, ValidationError
 from .siem import HttpSiemSink, OutboxPublisher
 from .store import Store
@@ -32,11 +33,13 @@ RESTART_PATH = re.compile(r"^/v1/runs/([0-9a-f-]+)/restart$")
 DRILL_PATH = re.compile(r"^/v1/drills/([0-9a-f-]+)$")
 DRILL_APPROVE_PATH = re.compile(r"^/v1/drills/([0-9a-f-]+)/approve$")
 DRILL_REJECT_PATH = re.compile(r"^/v1/drills/([0-9a-f-]+)/reject$")
+OUTBOX_REQUEUE_PATH = re.compile(r"^/v1/outbox/([0-9a-f-]+)/requeue$")
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     control_plane: ControlPlane
     authenticator: TokenAuthenticator
+    metrics_exporter: MetricsExporter
 
     def do_POST(self) -> None:
         try:
@@ -91,6 +94,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self._send(HTTPStatus.OK, result)
                 return
+            match = OUTBOX_REQUEUE_PATH.fullmatch(urlparse(self.path).path)
+            if match:
+                self.authenticator.require_role(principal, "responder")
+                result = self.control_plane.requeue_dead_letter(
+                    principal.tenant_id, match.group(1), principal.actor
+                )
+                self._send(HTTPStatus.ACCEPTED, result)
+                return
             self._send(HTTPStatus.NOT_FOUND, {"error": "route not found"})
         except Exception as error:
             self._send_error(error)
@@ -103,6 +114,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             principal = self._principal()
             self.authenticator.require_role(principal, "drill_author", "approver", "responder", "auditor")
+            if parsed.path == "/metrics":
+                self._send_text(
+                    HTTPStatus.OK,
+                    self.metrics_exporter.render(principal.tenant_id),
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+                return
+            if parsed.path == "/v1/outbox/dead-letters":
+                self._send(
+                    HTTPStatus.OK,
+                    self.control_plane.dead_letters(principal.tenant_id),
+                )
+                return
             match = DRILL_PATH.fullmatch(parsed.path)
             if match:
                 self._send(HTTPStatus.OK, self.control_plane.get_drill(principal.tenant_id, match.group(1)))
@@ -159,6 +183,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         encoded = json.dumps(body, separators=(",", ":")).encode()
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_text(self, status: HTTPStatus, body: str, content_type: str) -> None:
+        encoded = body.encode()
+        self.send_response(status.value)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -234,13 +266,24 @@ def build_server(
         store, signing_key=signing_key, adapter=adapter, deadline_seconds=deadline_seconds
     )
     ApiHandler.authenticator = TokenAuthenticator(auth_secret)
+    ApiHandler.metrics_exporter = MetricsExporter(store)
     server = ThreadingHTTPServer((host, port), ApiHandler)
     siem_url = os.environ.get("ASV_SIEM_URL", "")
     if siem_url:
         siem_token = os.environ.get("ASV_SIEM_BEARER_TOKEN", "")
         if not siem_token:
             raise RuntimeError("ASV_SIEM_BEARER_TOKEN is required when SIEM delivery is enabled")
-        publisher = OutboxPublisher(store, HttpSiemSink(siem_url, siem_token).send)
+        publisher = OutboxPublisher(
+            store,
+            HttpSiemSink(siem_url, siem_token).send,
+            max_attempts=int(os.environ.get("ASV_SIEM_MAX_ATTEMPTS", "8")),
+            base_backoff_seconds=float(
+                os.environ.get("ASV_SIEM_BASE_BACKOFF_SECONDS", "1")
+            ),
+            max_backoff_seconds=float(
+                os.environ.get("ASV_SIEM_MAX_BACKOFF_SECONDS", "300")
+            ),
+        )
         server.outbox_thread = publisher.start(  # type: ignore[attr-defined]
             float(os.environ.get("ASV_SIEM_INTERVAL_SECONDS", "5"))
         )

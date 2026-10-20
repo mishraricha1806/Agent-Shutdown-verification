@@ -1,0 +1,106 @@
+{{- if .Values.admissionPolicy.enabled }}
+{{- if not (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+{{- fail "admissionPolicy.enabled requires Kubernetes 1.30 or newer" }}
+{{- end }}
+{{- if and .Values.adversarialFixture.enabled (not (has .Values.adversarialFixture.namespace .Values.admissionPolicy.namespaces)) }}
+{{- fail "adversarialFixture.namespace must be included in admissionPolicy.namespaces" }}
+{{- end }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "asv.admissionPolicyName" . }}
+  labels:
+    {{- include "asv.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) &&
+        (!has(object.spec.hostPID) || !object.spec.hostPID) &&
+        (!has(object.spec.hostIPC) || !object.spec.hostIPC)
+      message: "ASV synthetic namespaces forbid hostNetwork, hostPID, and hostIPC"
+      reason: Forbidden
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(volume, !has(volume.hostPath))
+      message: "ASV synthetic namespaces forbid hostPath volumes"
+      reason: Forbidden
+    - expression: >-
+        object.spec.containers.all(container,
+          !has(container.securityContext) ||
+          !has(container.securityContext.privileged) ||
+          !container.securityContext.privileged) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(container,
+          !has(container.securityContext) ||
+          !has(container.securityContext.privileged) ||
+          !container.securityContext.privileged)) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(container,
+          !has(container.securityContext) ||
+          !has(container.securityContext.privileged) ||
+          !container.securityContext.privileged))
+      message: "ASV synthetic namespaces forbid privileged containers"
+      reason: Forbidden
+    - expression: >-
+        object.spec.containers.all(container,
+          has(container.securityContext) &&
+          has(container.securityContext.allowPrivilegeEscalation) &&
+          !container.securityContext.allowPrivilegeEscalation) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(container,
+          has(container.securityContext) &&
+          has(container.securityContext.allowPrivilegeEscalation) &&
+          !container.securityContext.allowPrivilegeEscalation)) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(container,
+          has(container.securityContext) &&
+          has(container.securityContext.allowPrivilegeEscalation) &&
+          !container.securityContext.allowPrivilegeEscalation))
+      message: "Every ASV container must set allowPrivilegeEscalation=false"
+      reason: Forbidden
+    - expression: >-
+        object.spec.containers.all(container,
+          !has(container.securityContext) ||
+          !has(container.securityContext.capabilities) ||
+          !has(container.securityContext.capabilities.add) ||
+          size(container.securityContext.capabilities.add) == 0) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(container,
+          !has(container.securityContext) ||
+          !has(container.securityContext.capabilities) ||
+          !has(container.securityContext.capabilities.add) ||
+          size(container.securityContext.capabilities.add) == 0)) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(container,
+          !has(container.securityContext) ||
+          !has(container.securityContext.capabilities) ||
+          !has(container.securityContext.capabilities.add) ||
+          size(container.securityContext.capabilities.add) == 0))
+      message: "ASV synthetic namespaces forbid adding Linux capabilities"
+      reason: Forbidden
+    - expression: >-
+        !has(object.spec.securityContext) ||
+        !has(object.spec.securityContext.windowsOptions) ||
+        !has(object.spec.securityContext.windowsOptions.hostProcess) ||
+        !object.spec.securityContext.windowsOptions.hostProcess
+      message: "ASV synthetic namespaces forbid Windows HostProcess pods"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "asv.admissionPolicyName" . }}
+  labels:
+    {{- include "asv.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "asv.admissionPolicyName" . }}
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+            {{- toYaml .Values.admissionPolicy.namespaces | nindent 12 }}
+{{- end }}

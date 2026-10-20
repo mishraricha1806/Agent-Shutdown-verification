@@ -59,6 +59,9 @@ siem:
   url: ""
   bearerTokenSecretKey: siem-bearer-token
   intervalSeconds: 5
+  maxAttempts: 8
+  baseBackoffSeconds: 1
+  maxBackoffSeconds: 300
 
 adversarialFixture:
   enabled: false
@@ -83,6 +86,13 @@ adversarialFixture:
     url: ""
     destination: ""
     tokenSecretKey: egress-token
+
+# Cluster-scoped ValidatingAdmissionPolicy for disposable synthetic namespaces.
+# Requires Kubernetes 1.30+ and cluster-admin installation privileges.
+admissionPolicy:
+  enabled: false
+  namespaces:
+    - asv-synthetic
 
 secrets:
   # Pre-create this Secret. The chart never stores secret material in values.

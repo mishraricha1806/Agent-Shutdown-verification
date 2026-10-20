@@ -12,3 +12,12 @@ return UNKNOWN for external probes until a real adapter is configured.
 
 When enabling adapter.mode=kubernetes, also enable rbac.kubernetesAdapter and
 set networkPolicy.kubernetesApiCIDR to the API Service ClusterIP as a /32.
+
+{{- if .Values.admissionPolicy.enabled }}
+
+The Kubernetes 1.30+ admission policy is active for:
+{{- range .Values.admissionPolicy.namespaces }}
+  - {{ . }}
+{{- end }}
+Run the documented server-side negative Pod test before enabling the fixture.
+{{- end }}

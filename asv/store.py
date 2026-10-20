@@ -91,6 +91,15 @@ CREATE TABLE IF NOT EXISTS event_outbox (
   created_at TEXT NOT NULL,
   delivered_at TEXT NULL
 );
+CREATE TABLE IF NOT EXISTS event_delivery_state (
+  event_id TEXT PRIMARY KEY REFERENCES event_outbox(event_id),
+  next_attempt_at TEXT NULL,
+  dead_lettered_at TEXT NULL
+);
+CREATE TABLE IF NOT EXISTS event_retry_cycle (
+  event_id TEXT PRIMARY KEY REFERENCES event_outbox(event_id),
+  attempts_baseline INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS report (
   run_id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,

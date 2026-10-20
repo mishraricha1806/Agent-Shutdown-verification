@@ -567,6 +567,58 @@ class ControlPlane:
             )
         return {"events": events, "count": len(events)}
 
+    def dead_letters(self, tenant_id: str, limit: int = 100) -> dict[str, Any]:
+        if limit < 1 or limit > 1000:
+            raise ValidationError("dead-letter limit must be between 1 and 1000")
+        with self.store.connection() as connection:
+            rows = connection.execute(
+                "SELECT outbox.event_id,outbox.run_id,outbox.attempts,"
+                "outbox.last_error,outbox.created_at,delivery.dead_lettered_at "
+                "FROM event_outbox AS outbox "
+                "LEFT JOIN event_delivery_state AS delivery "
+                "ON delivery.event_id=outbox.event_id "
+                "WHERE outbox.tenant_id=? AND outbox.status='DEAD_LETTER' "
+                "ORDER BY delivery.dead_lettered_at,outbox.created_at LIMIT ?",
+                (tenant_id, limit),
+            ).fetchall()
+        return {"dead_letters": [dict(row) for row in rows], "count": len(rows)}
+
+    def requeue_dead_letter(
+        self, tenant_id: str, event_id: str, actor: str
+    ) -> dict[str, Any]:
+        with self.store.connection() as connection:
+            row = connection.execute(
+                "SELECT event_id,run_id,status,attempts FROM event_outbox "
+                "WHERE tenant_id=? AND event_id=?",
+                (tenant_id, event_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("dead-letter event not found for tenant")
+            if row["status"] != "DEAD_LETTER":
+                raise ConflictError("only dead-letter events can be requeued")
+            connection.execute(
+                "UPDATE event_outbox SET status='PENDING',last_error=NULL,"
+                "delivered_at=NULL WHERE tenant_id=? AND event_id=?",
+                (tenant_id, event_id),
+            )
+            connection.execute(
+                "DELETE FROM event_delivery_state WHERE event_id=?", (event_id,)
+            )
+            connection.execute(
+                "INSERT INTO event_retry_cycle VALUES (?,?) "
+                "ON CONFLICT(event_id) DO UPDATE SET "
+                "attempts_baseline=excluded.attempts_baseline",
+                (event_id, row["attempts"]),
+            )
+        run = self.get_run(tenant_id, row["run_id"])
+        self._append_event(
+            run,
+            "siem.dead_letter.requeued",
+            {"event_id": event_id},
+            actor,
+        )
+        return {"event_id": event_id, "run_id": row["run_id"], "status": "PENDING"}
+
     def request_restart(self, tenant_id: str, run_id: str, actor: str) -> dict[str, Any]:
         run = self._adapter_run(tenant_id, run_id)
         if ShutdownState(run["state"]) not in TERMINAL_STATES:

@@ -37,3 +37,6 @@ app.kubernetes.io/component: controller
 {{- default (include "asv.fullname" .) .Values.persistence.existingClaim }}
 {{- end }}
 
+{{- define "asv.admissionPolicyName" -}}
+{{- printf "%s-%s-pod-security" .Release.Namespace (include "asv.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}

@@ -53,11 +53,17 @@ reported as `UNKNOWN` rather than being treated as successful containment.
 - Produces independent `PASS`, `FAIL`, `PARTIAL`, or `UNKNOWN` probe results.
 - Stores a per-run SHA-256 evidence chain and HMAC-signed manifest.
 - Creates immutable signed JSON shutdown reports.
-- Persists lifecycle events to a transactional outbox and retries SIEM delivery.
+- Persists lifecycle events to a transactional outbox with exponential retry,
+  bounded attempts, durable dead-lettering, and audited operator requeue.
+- Exposes authenticated, tenant-scoped Prometheus metrics without resource IDs
+  or tenant identifiers in labels.
 - Verifies authorized restart policy continuity and old-identity revocation.
 - Enforces signed, expiring service tokens and operator roles.
 - Requires a different authenticated approver before a requested drill can start.
 - Provides an opt-in adversarial fixture for the full pilot scenario.
+- Provides an opt-in Kubernetes admission policy that blocks privileged Pods,
+  host namespaces, host paths, privilege escalation, and added capabilities in
+  synthetic namespaces.
 - Ships as a non-root container and Helm chart with opt-in Kubernetes RBAC.
 
 All external integrations are opt-in. Any adapter that is not configured or
@@ -76,6 +82,7 @@ flowchart LR
     C --> H["Evidence ledger"]
     D --> H
     H --> I["JSON and SIEM export"]
+    H --> J["Prometheus metrics"]
 ```
 
 The current implementation is a single control-plane process backed by SQLite.
@@ -112,10 +119,12 @@ See [the threat model](docs/threat-model.md) for abuse cases and unresolved risk
 | Evidence hash chain | Implemented |
 | Evidence signature | Development HMAC signer only |
 | Signed JSON report | Implemented and cached per terminal run |
-| Durable SIEM delivery | Transactional outbox with at-least-once HTTP delivery |
+| Durable SIEM delivery | Transactional outbox with backoff, dead letters, and audited requeue |
 | Authorized restart probe | Implemented through the restart gateway contract |
 | Separation-of-duty drill approval | Implemented and persisted |
 | Adversarial pilot fixture | Implemented; disabled by default |
+| Operational metrics | Authenticated tenant-scoped Prometheus text endpoint |
+| Synthetic admission policy | Implemented with Kubernetes 1.30+ CEL validation |
 | Helm packaging and restricted RBAC | Implemented |
 | Restart recovery | Implemented for the single-replica SQLite deployment |
 | High availability | Not implemented |
@@ -129,6 +138,7 @@ For local development:
 For a Kubernetes lab:
 
 - Kubernetes 1.27 or newer
+- Kubernetes 1.30 or newer when the admission policy or adversarial fixture is enabled
 - Helm 3 or 4
 - A CNI that enforces `NetworkPolicy`
 - A dedicated control namespace, such as `asv-system`
@@ -312,7 +322,9 @@ helm upgrade --install asv deploy/helm/agent-shutdown-verification \
 
 The chart fails rendering when adapter mode and RBAC are inconsistent, when the
 Kubernetes API CIDR is missing, when probe egress is not explicit, or when a
-target namespace does not use the `asv-*` prefix.
+target namespace does not use the `asv-*` prefix. The adversarial fixture also
+requires the Kubernetes 1.30+ admission policy and must run in one of its bound
+synthetic namespaces.
 
 For the detailed shutdown behavior and Kafka assumptions, read the
 [Kubernetes and Kafka adapter guide](docs/kubernetes-kafka-adapter.md).
@@ -322,6 +334,8 @@ Report, outbox delivery, and restart semantics are specified in the
 [Week 5 operations guide](docs/report-siem-restart.md).
 The complete adversarial exercise and acceptance criteria are in the
 [pilot runbook](docs/pilot-runbook.md).
+Admission controls and the required negative preflight are in the
+[synthetic namespace admission guide](docs/admission-policy.md).
 
 ## Operate a drill
 
@@ -481,6 +495,9 @@ Interpret terminal states conservatively:
 | `GET /v1/runs/{runId}/events` | Any operator role | Export SIEM event envelopes |
 | `POST /v1/runs/{runId}/restart` | `responder` | Execute the authorized restart probe |
 | `GET /v1/runs/{runId}/report` | Any operator role | Retrieve the immutable signed report |
+| `GET /v1/outbox/dead-letters` | Any operator role | List tenant-scoped failed SIEM deliveries |
+| `POST /v1/outbox/{eventId}/requeue` | `responder` | Requeue a dead letter and audit the action |
+| `GET /metrics` | Any operator role | Read tenant-scoped Prometheus metrics |
 | `GET /healthz` | None | Kubernetes liveness and readiness check |
 
 The supported roles are:
@@ -516,6 +533,11 @@ key.
 Treat the current HMAC signature as a development integrity mechanism. Because
 verification requires the shared signing secret, it does not yet satisfy the
 brief’s KMS-backed asymmetric offline-verification requirement.
+
+The authenticated `/metrics` endpoint reports shutdown phases, probe results,
+delegated work, recovery, evidence integrity, and SIEM delivery without exposing
+tenant or resource identifiers as labels. Metric definitions and minimum alert
+recommendations are in the [operations metrics guide](docs/metrics.md).
 
 ## Operations
 
@@ -612,6 +634,9 @@ post-drill cleanup procedure after evidence has been exported.
 | `ASV_SIEM_URL` | Empty | Enables background outbox delivery |
 | `ASV_SIEM_BEARER_TOKEN` | Empty | SIEM ingestion token |
 | `ASV_SIEM_INTERVAL_SECONDS` | `5` | Pending-event polling interval |
+| `ASV_SIEM_MAX_ATTEMPTS` | `8` | Delivery attempts before dead-lettering |
+| `ASV_SIEM_BASE_BACKOFF_SECONDS` | `1` | Initial exponential retry delay |
+| `ASV_SIEM_MAX_BACKOFF_SECONDS` | `300` | Maximum retry delay |
 | `ASV_RECOVERY_INTERVAL_SECONDS` | `5` | Incomplete-shutdown recovery polling interval |
 
 The authoritative Helm defaults and validation constraints are in
@@ -635,10 +660,12 @@ drill:
 - Validate credential and egress contracts against the selected enterprise
   broker and gateway, including latency, expiry, and existing-connection tests.
 - Replace the single-process HTTP outbox worker with a horizontally safe delivery
-  service, add backoff/dead-letter handling, and add durable Kafka publication.
-- Add metrics for fencing, termination, credential rejection, network denial,
-  remaining jobs/actions, unknown probes, and evidence-integrity failures.
-- Add admission policies that reject privileged workloads and host-path mounts.
+  service, add durable Kafka publication, and integrate dead-letter response with
+  enterprise incident management.
+- Integrate the metrics endpoint with managed monitoring, rotating scrape
+  identity, recording rules, tested alerts, and long-term metric retention.
+- Integrate the synthetic admission policy with the enterprise cluster-policy
+  baseline, image admission, exemption governance, and runtime detection.
 - Integrate separation-of-duty approval with an external identity provider and
   enterprise change-management records.
 - Add external security review, threat-model validation, load testing, disaster

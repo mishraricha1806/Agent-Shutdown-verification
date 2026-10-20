@@ -1,4 +1,7 @@
 {{- if .Values.adversarialFixture.enabled }}
+{{- if not .Values.admissionPolicy.enabled }}
+{{- fail "admissionPolicy.enabled must be true when the adversarial fixture is enabled" }}
+{{- end }}
 {{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" .Values.adversarialFixture.runId) }}
 {{- fail "adversarialFixture.runId must be a lowercase UUID" }}
 {{- end }}

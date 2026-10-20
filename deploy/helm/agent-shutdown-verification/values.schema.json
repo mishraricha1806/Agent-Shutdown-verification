@@ -76,12 +76,15 @@
     },
     "siem": {
       "type": "object",
-      "required": ["enabled", "url", "bearerTokenSecretKey", "intervalSeconds"],
+      "required": ["enabled", "url", "bearerTokenSecretKey", "intervalSeconds", "maxAttempts", "baseBackoffSeconds", "maxBackoffSeconds"],
       "properties": {
         "enabled": {"type": "boolean"},
         "url": {"type": "string"},
         "bearerTokenSecretKey": {"type": "string", "minLength": 1},
-        "intervalSeconds": {"type": "number", "minimum": 0.25, "maximum": 3600}
+        "intervalSeconds": {"type": "number", "minimum": 0.25, "maximum": 3600},
+        "maxAttempts": {"type": "integer", "minimum": 1, "maximum": 100},
+        "baseBackoffSeconds": {"type": "number", "minimum": 0, "maximum": 3600},
+        "maxBackoffSeconds": {"type": "number", "minimum": 0, "maximum": 86400}
       }
     },
     "adversarialFixture": {
@@ -106,6 +109,19 @@
         "kafkaRest": {"type": "object"},
         "credentialBroker": {"type": "object"},
         "egressGateway": {"type": "object"}
+      }
+    },
+    "admissionPolicy": {
+      "type": "object",
+      "required": ["enabled", "namespaces"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespaces": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^asv-[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+        }
       }
     },
     "secrets": {
@@ -138,5 +154,5 @@
       }
     }
   },
-  "required": ["replicaCount", "image", "controller", "adapter", "siem", "adversarialFixture", "secrets", "persistence", "rbac"]
+  "required": ["replicaCount", "image", "controller", "adapter", "siem", "adversarialFixture", "admissionPolicy", "secrets", "persistence", "rbac"]
 }

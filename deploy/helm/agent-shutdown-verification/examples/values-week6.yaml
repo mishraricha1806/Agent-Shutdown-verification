@@ -31,6 +31,10 @@ rbac:
 persistence:
   enabled: true
 
+admissionPolicy:
+  enabled: true
+  namespaces: [asv-synthetic]
+
 networkPolicy:
   kubernetesApiCIDR: 10.96.0.1/32
   extraEgress:

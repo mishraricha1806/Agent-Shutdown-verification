@@ -25,6 +25,9 @@ The author and approver must be different authenticated actors.
 
 - Written pilot authorization and scheduled change window.
 - Dedicated `asv-system` and `asv-*` target namespaces.
+- Kubernetes 1.30 or newer with `ValidatingAdmissionPolicy` enabled.
+- ASV admission policy installed for every target namespace and its negative
+  privileged/host-network Pod test confirmed denied.
 - NetworkPolicy enforcement confirmed with a negative connectivity test.
 - Controller and fixture images scanned, signed, and referenced by immutable tag.
 - Controller, Kafka, broker, gateway, restart, and SIEM tokens created only for
@@ -43,13 +46,15 @@ helm lint deploy/helm/agent-shutdown-verification \
 
 helm template asv deploy/helm/agent-shutdown-verification \
   --namespace asv-system \
+  --kube-version 1.30.0 \
   -f values-pilot.yaml > rendered-pilot.yaml
 
 kubectl diff --server-side -f rendered-pilot.yaml
 ```
 
 Deploy the controller with `adversarialFixture.enabled=false`, verify rollout,
-then run `helm test`.
+then run `helm test`. Execute the server-side negative test from
+[the admission policy guide](admission-policy.md) before enabling the fixture.
 
 ## Execution
 
